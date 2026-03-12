@@ -1,0 +1,36 @@
+{
+    "id": "move-everything-structor",
+    "name": "Structor",
+    "abbrev": "STRCT",
+    "version": "0.1.0",
+    "description": "Musique concrète sound deconstructor/reconstructor",
+    "author": "fillioning",
+    "dsp": "move-everything-structor.so",
+    "ui_chain": "ui_chain.js",
+    "api_version": 2,
+    "component_type": "audio_fx",
+    "raw_midi": true,
+    "capabilities": {
+        "chainable": true,
+        "component_type": "audio_fx",
+        "audio_in": true,
+        "ui_hierarchy": {
+            "levels": {
+                "root": {
+                    "name": "Structor",
+                    "params": [
+                        { "key": "detection",  "name": "Detection",  "type": "float", "min": 0,   "max": 1,   "default": 0.1,  "step": 0.01 },
+                        { "key": "density",    "name": "Density",    "type": "float", "min": 0.1, "max": 1,   "default": 0.7,  "step": 0.01 },
+                        { "key": "grain_size", "name": "Grain Size", "type": "float", "min": 0.5, "max": 2,   "default": 1.0,  "step": 0.01 },
+                        { "key": "time_warp",  "name": "Time Warp",  "type": "float", "min": 0.5, "max": 2,   "default": 1.0,  "step": 0.01 },
+                        { "key": "mix",        "name": "Mix",        "type": "float", "min": 0,   "max": 1,   "default": 0.5,  "step": 0.01 },
+                        { "key": "feedback",   "name": "Feedback",   "type": "float", "min": 0,   "max": 0.95,"default": 0.2,  "step": 0.01 },
+                        { "key": "mode",       "name": "Mode",       "type": "int",   "min": 0,   "max": 6,   "default": 0,    "step": 1 },
+                        { "key": "special",    "name": "Special",    "type": "float", "min": 0,   "max": 1,   "default": 0.5,  "step": 0.01 }
+                    ],
+                    "knobs": ["detection", "density", "grain_size", "time_warp", "mix", "feedback", "mode", "special"]
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,58 @@
+name: Build & Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  check-version:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Verify tag matches module.json version
+        run: |
+          TAG_VERSION="${GITHUB_REF_NAME#v}"
+          JSON_VERSION=$(grep -o '"version": *"[^"]*"' module.json | head -1 | grep -o '[0-9][^"]*')
+          if [ "$TAG_VERSION" != "$JSON_VERSION" ]; then
+            echo "ERROR: Tag $TAG_VERSION does not match module.json version $JSON_VERSION"
+            exit 1
+          fi
+
+  build:
+    needs: check-version
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install ARM64 cross-compiler
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Build
+        run: |
+          chmod +x scripts/build.sh
+          CROSS_PREFIX=aarch64-linux-gnu- scripts/build.sh
+
+      - name: Package
+        run: |
+          cd dist
+          tar czf ../move-everything-structor-${{ github.ref_name }}-arm64.tar.gz move-everything-structor/
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: move-everything-structor-${{ github.ref_name }}-arm64.tar.gz
+
+      - name: Update release.json
+        run: |
+          TAG="${{ github.ref_name }}"
+          URL="https://github.com/${{ github.repository }}/releases/download/${TAG}/move-everything-structor-${TAG}-arm64.tar.gz"
+          cat > release.json << EOF
+          {
+            "tag": "${TAG}",
+            "url": "${URL}",
+            "module_id": "move-everything-structor",
+            "component_type": "audio_fx"
+          }
+          EOF
