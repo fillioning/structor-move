@@ -635,8 +635,10 @@ static void structor_process(void *instance, int16_t *audio_inout, int frames) {
         /* Convert to int16 */
         int32_t il = (int32_t)(out_l * 32767.0f);
         int32_t ir = (int32_t)(out_r * 32767.0f);
-        if (il > 32767) il = 32767; if (il < -32768) il = -32768;
-        if (ir > 32767) ir = 32767; if (ir < -32768) ir = -32768;
+        if (il > 32767) il = 32767;
+        if (il < -32768) il = -32768;
+        if (ir > 32767) ir = 32767;
+        if (ir < -32768) ir = -32768;
         audio_inout[i * 2]     = (int16_t)il;
         audio_inout[i * 2 + 1] = (int16_t)ir;
     }
