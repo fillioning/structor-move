@@ -1,8 +1,8 @@
 # Structor
 
-Musique concrete sound deconstructor/reconstructor for Ableton Move.
+Musique concrete-inspired sound deconstructor/reconstructor for Ableton Move.
 
-An audio FX plugin for the [Move Everything](https://github.com/charlesvestal/move-anything) framework. Deconstructs audio into detected events (onsets, peaks, zero-crossings) and reconstructs them in 8 algorithmic modes with per-grain Isolator3 DJ filtering, randomization, and a sequencer.
+An audio FX plugin for the [Move Everything](https://github.com/charlesvestal/move-everything) framework. Deconstructs audio into detected events (onsets, peaks, zero-crossings) and reconstructs them in 8 algorithmic modes with per-grain LP/HP filtering, randomization, and a sequencer for random parameters.
 
 Original DSP — envelope follower + FFT spectral analysis (PFFFT) + grain-based reconstruction.
 
