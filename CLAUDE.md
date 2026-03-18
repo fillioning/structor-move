@@ -4,7 +4,7 @@
 Musique concrete & acousmatique-inspired real-time sound deconstructor/reconstructor for Ableton Move.
 
 Plugin type: audio_fx
-Module ID: `move-everything-structor`
+Module ID: `structor`
 API: `audio_fx_api_v2_t`
 Entry: `move_audio_fx_init_v2(const host_api_v1_t *host)`
 Language: C
@@ -16,20 +16,24 @@ Read `design-spec.md` for full design intent. This file is the compressed versio
 ## Sonic intent
 Inspired by micro-montage techniques from musique concrete (Schaeffer, Parmegiani).
 Deconstructs audio into detected events (onsets, peaks, zero-crossings), then
-reconstructs them in 7 algorithmic modes — from random chaos to pitch-sorted sweeps
-to density arpeggiators to the tape-cut "Deltarupt" effect. Not a granular synth,
-not a delay, not a spectral processor.
+reconstructs them in 8 algorithmic modes — from random chaos to pitch-sorted sweeps
+to density arpeggiators to the tape-cut "Deltarupt" to the spectral-density hybrid
+"Spec Warp." Not a granular synth, not a delay, not a spectral processor.
 
 ---
 
 ## DSP architecture
 Audio enters a circular ring buffer (~3 sec, 131072 samples stereo @ 44.1 kHz).
-An envelope follower + zero-crossing detector identifies events (onsets, peaks, ZC).
+An envelope follower + FFT-based spectral estimator (pffft, 256-point real FFT with
+parabolic interpolation) identifies events (onsets, peaks, spectral center frequency).
 Events are culled by amplitude (Density param). A mode-dependent algorithm reorders
-events (shuffle, sort, arp cycle). Grain-based synthesis reads back events with Hann
-windowing and Hermite interpolation. Deltarupt mode uses a quadratic attack envelope
-with instant cutoff. Output passes through tanh soft limiting and wet/dry mixing.
-Feedback recirculates output back into the buffer.
+events (shuffle, sort, arp cycle, spectral-density warp). Grain-based synthesis reads
+back events with Hann windowing and Hermite interpolation. Deltarupt mode uses a
+quadratic attack envelope with instant cutoff. Output passes through tanh soft limiting
+and wet/dry mixing. Feedback recirculates output back into the buffer.
+
+FFT state (PFFFT_Setup + aligned buffers) is pre-allocated in create() — zero
+allocation in the render path.
 
 ---
 
@@ -50,34 +54,32 @@ Feedback recirculates output back into the buffer.
 
 | Knob | Key | Label | Type | Range | Default | Step |
 |------|-----|-------|------|-------|---------|------|
-| 7 | `mode` | Mode | Enum | 0–6 | 0 | 1 |
+| 7 | `mode` | Mode | Enum | 0–7 | 0 | 1 |
 
-Modes: 0=Random Remix, 1=Pitch ↑, 2=Pitch ↓, 3=Density ↑, 4=Time Warp, 5=Density Arp, 6=Deltarupt
+Modes: 0=Random, 1=Pitch ↑, 2=Pitch ↓, 3=Density ↑, 4=Time Warp, 5=Dens Arp, 6=Deltarupt, 7=Spec Warp
 
 ### Knob 8: Mode-specific (context-sensitive)
 
-| Mode | Key | Label | Type | Range | Default | Step |
-|------|-----|-------|------|-------|---------|------|
-| 0 — Random | `reshuffle` | Reshuffle | Float | 0.0–1.0 | 0.5 | 0.01 |
-| 1 — Pitch ↑ | `scatter` | Scatter | Float | 0.0–1.0 | 0.0 | 0.01 |
-| 2 — Pitch ↓ | `scatter` | Scatter | Float | 0.0–1.0 | 0.0 | 0.01 |
-| 3 — Density ↑ | `curve` | Curve | Float | 0.0–1.0 | 0.0 | 0.01 |
-| 4 — Time Warp | `drift` | Drift | Float | 0.0–1.0 | 0.3 | 0.01 |
-| 5 — Density Arp | `arp_pattern` | Arp Ptrn | Enum | 0–5 | 0 | 1 |
-| 6 — Deltarupt | `deltarupt_attack` | Attack | Float | 0.0–1.0 | 0.05 | 0.01 |
+| Mode | Key | Label | Type | Range | Default |
+|------|-----|-------|------|-------|---------|
+| 0 — Random | `shuffle_bias` | Shfl Bias | Float | 0.0–1.0 | 0.5 |
+| 1 — Pitch ↑ | `pitch_range_window` | Pitch Win | Float | 0.0–1.0 | 0.0 |
+| 2 — Pitch ↓ | `octave_fold` | Oct Fold | Enum | 0–4 | 0 |
+| 3 — Density ↑ | `density_curve` | Dens Crv | Float | 0.0–1.0 | 0.0 |
+| 4 — Time Warp | `speed_curve_exp` | Spd Curve | Float | 0.5–2.0 | 1.0 |
+| 5 — Dens Arp | `arp_pattern` | Arp Ptrn | Enum | 0–5 | 0 |
+| 6 — Deltarupt | `deltarupt_attack` | Attack | Float | 0.0–1.0 | 0.05 |
+| 7 — Spec Warp | `density_morphing` | Morphing | Float | 0.0–1.0 | 0.0 |
 
 Arp patterns: 0=Up, 1=Down, 2=Up-Down, 3=Down-Up, 4=Random, 5=Cascade
+Octave folds: 0=None, 1=1 Oct, 2=Mirror, 3=Harmonic, 4=Inharm
 
 Knob 8 popup label and value change dynamically based on current mode.
 
 ---
 
-## Open questions (resolve before implementing the relevant section)
-- Multi-page knob layout (currently 1 page × 8) — expand later?
-- Jog wheel assignment (currently unused)
-- FFT-based spectral analysis as Phase 2 ZCR replacement
-- ui_chain.js design for Shadow UI integration
-- Preset system — deferred to post-MVP
+## Open questions
+- None — all design questions resolved as of v0.2.0
 
 ---
 
@@ -102,7 +104,7 @@ Knob 8 popup label and value change dynamically based on current mode.
 - MIDI export: `move_audio_fx_on_midi` via `dlsym` (not struct pointer)
 - `raw_midi: true` at root level of module.json
 - Capabilities: `chainable: true, component_type: "audio_fx", audio_in: true`
-- Install path: `modules/audio_fx/move-everything-structor/`
+- Install path: `modules/audio_fx/structor/`
 
 ## Knob overlay implementation (critical)
 
@@ -114,15 +116,20 @@ The Shadow UI does NOT pass knob CCs to ui_chain.js. The framework calls DSP dir
 For Knob 8: check `current_mode` in `knob_8_adjust` handler, route delta to the
 correct mode-specific parameter, and return the correct label/value in get_param.
 
-Use `%d%%` for percentage display, `%s` for enum names. Never `%.2f`.
+Display formats:
+- Float params: `%d%%` (percentage)
+- Enum params: name string (e.g. "Up-Down", "Mirror")
+- Speed curve: `%.1fx` (e.g. "1.5x")
 
 ---
 
 ## Repo map
-- `src/structor.c` — all DSP + Move API wrapper (single file, ~600 lines)
+- `src/structor.c` — all DSP + Move API wrapper (single file)
+- `src/pffft.c`, `src/pffft.h` — PFFFT library (BSD-like, cpuimage/pffft)
+- `src/fftpack.c`, `src/fftpack.h` — FFTPACK dependency for pffft
 - `module.json` — module metadata (version must match git tag)
-- `ui_chain.js` — Shadow UI (jog menu + knob handling, Clouds-style dynamic subheader)
-- `scripts/build.sh` — Docker ARM64 cross-compile
+- `ui_chain.js` — Shadow UI (jog menu + dynamic Knob 8 + mode subheader)
+- `scripts/build.sh` — ARM64 cross-compile (3 source files → single .so)
 - `scripts/install.sh` — deploy via SSH + fix ownership
 - `Dockerfile` — build container (debian bookworm-slim + aarch64 gcc + dos2unix)
 - `.github/workflows/release.yml` — CI: version check, build, tag, release tarball
@@ -132,16 +139,15 @@ Use `%d%%` for percentage display, `%s` for enum names. Never `%.2f`.
 
 ## Build
 ```bash
-# Docker (preferred — no local compiler needed)
-docker build -t structor-builder .
-docker cp $(docker create structor-builder):/build/dist/move-everything-structor ./dist/
-
-# Or with local cross-compiler
-CROSS_PREFIX=aarch64-linux-gnu- ./scripts/build.sh
+# Always use scripts/build.sh (matches CI exactly)
+./scripts/build.sh
 
 # Deploy
-./scripts/install.sh [move-ip]
+./scripts/install.sh
 ```
+
+Source files: `fftpack.c`, `pffft.c`, `structor.c` (compiled together into single .so).
+Compiler flags: `-O2 -shared -fPIC -ffast-math -Wall`
 
 ## Release
 Use `/move-anything-release` when ready.

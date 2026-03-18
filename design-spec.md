@@ -1,9 +1,9 @@
 # Structor — Design Spec
 
-> **Status:** Pre-implementation (prototype code exists, needs full rewrite to Move Everything API)
+> **Status:** v0.2.0 (8 modes, Knob 8 rework)
 > **Plugin type:** audio_fx
-> **Module ID:** `move-everything-structor`
-> **Last updated:** 2025-03-12
+> **Module ID:** `structor`
+> **Last updated:** 2026-03-13
 
 ---
 
@@ -12,21 +12,22 @@
 Structor is a real-time sound deconstructor/reconstructor for Ableton Move.
 Audio enters, gets written to a circular buffer (~3 sec). An event detector
 identifies onsets, peaks, and zero-crossings. A reconstruction engine then
-reassembles detected events into new temporal orders using one of 7 modes —
+reassembles detected events into new temporal orders using one of 8 modes —
 from random shuffling to pitch-sorted sweeps to density arpeggiators to the
-percussive tape-cut effect "Deltarupt." Output is grain-based with Hann
-windowing, Hermite interpolation, wet/dry mix, and feedback recirculation.
+percussive tape-cut effect "Deltarupt" to the spectral-density hybrid "Spec Warp."
+Output is grain-based with Hann windowing, Hermite interpolation, wet/dry mix,
+and feedback recirculation.
 
 ## Sonic intent
 
 **References:** Musique concrete micro-montage (Pierre Schaeffer, Bernard
 Parmegiani), acousmatic sound composition, tape splicing, PO-33 style
-glitch effects.
+glitch effects, Unfiltered Audio SpecOps (spectral bin analysis).
 
 **Philosophy:** Deconstruct the temporal structure of sound and rebuild it
 algorithmically. Each mode offers a different listening perspective on the
 same source material — from chaos (Random) to order (Pitch Sort) to rhythm
-(Density Arp) to violence (Deltarupt).
+(Density Arp) to violence (Deltarupt) to intelligence (Spec Warp).
 
 **Not:** A granular synthesizer (no pitch shifting of grains). Not a delay or
 reverb — the buffer is for event detection, not echo. Not a spectral
@@ -61,7 +62,6 @@ Audio In (stereo int16)
 ```
 
 **Known DSP challenges:**
-- Current prototype does `malloc`/`free` per block — must pre-allocate
 - ZCR-based frequency estimation is rough — FFT would be better (Phase 2)
 - No denormal guard yet — ARM has no FTZ, needs `-ffast-math`
 - Event detection minimum spacing (10 ms) may need tuning per mode
@@ -85,33 +85,35 @@ Audio In (stereo int16)
 
 | # | Name | Key | Type | Range | Default | Notes |
 |---|------|-----|------|-------|---------|-------|
-| 7 | Mode | `mode` | Enum | 0–6 | 0 | Reconstruction mode (see below) |
+| 7 | Mode | `mode` | Enum | 0–7 | 0 | Reconstruction mode (see below) |
 
 ### Knob 8: Mode-specific parameter (context-sensitive)
 
 | Mode | Knob 8 Name | Key | Type | Range | Default | Description |
 |------|-------------|-----|------|-------|---------|-------------|
-| 0 — Random Remix | Reshuffle | `reshuffle` | Float | 0.0–1.0 | 0.5 | Re-randomization rate (0=static shuffle, 1=constant chaos) |
-| 1 — Pitch ↑ | Scatter | `scatter` | Float | 0.0–1.0 | 0.0 | Sort fidelity (0=strict ascending, 1=noisy/loose sort) |
-| 2 — Pitch ↓ | Scatter | `scatter` | Float | 0.0–1.0 | 0.0 | Sort fidelity (0=strict descending, 1=noisy/loose sort) |
-| 3 — Density ↑ | Curve | `curve` | Float | 0.0–1.0 | 0.0 | Gradient shape (0=linear, 0.5=logarithmic, 1=exponential) |
-| 4 — Time Warp | Drift | `drift` | Float | 0.0–1.0 | 0.3 | Speed deviation range (0=subtle variation, 1=extreme warping) |
-| 5 — Density Arp | Arp Pattern | `arp_pattern` | Enum | 0–5 | 0 | Up / Down / Up-Down / Down-Up / Random / Cascade |
-| 6 — Deltarupt | Attack | `deltarupt_attack` | Float | 0.0–1.0 | 0.05 | Envelope rise time (0=percussive click, 1=full-grain bloom) |
+| 0 — Random Remix | Shfl Bias | `shuffle_bias` | Float | 0.0–1.0 | 0.5 | 0=pure random, 1=constrained nearby swaps |
+| 1 — Pitch ↑ | Pitch Win | `pitch_range_window` | Float | 0.0–1.0 | 0.0 | 0=strict sort, 1=coarse frequency quantization |
+| 2 — Pitch ↓ | Oct Fold | `octave_fold` | Enum | 0–4 | 0 | None/1 Oct/Mirror/Harmonic/Inharmonic |
+| 3 — Density ↑ | Dens Crv | `density_curve` | Float | 0.0–1.0 | 0.0 | 0=linear crescendo, 0.5=sigmoid, 1=exponential |
+| 4 — Time Warp | Spd Curve | `speed_curve_exp` | Float | 0.5–2.0 | 1.0 | Amplitude-to-speed mapping exponent |
+| 5 — Density Arp | Arp Ptrn | `arp_pattern` | Enum | 0–5 | 0 | Up/Down/Up-Down/Down-Up/Random/Cascade |
+| 6 — Deltarupt | Attack | `deltarupt_attack` | Float | 0.0–1.0 | 0.05 | Envelope rise time (0=click, 1=full bloom) |
+| 7 — Spec Warp | Morphing | `density_morphing` | Float | 0.0–1.0 | 0.0 | 0=pure pitch sort, 1=pure density sort |
 
 ---
 
-## 7 Reconstruction modes
+## 8 Reconstruction modes
 
 | Mode | Name | Algorithm | Knob 8 | Sound character |
 |------|------|-----------|--------|-----------------|
-| 0 | Random Remix | Fisher-Yates shuffle | Reshuffle | Unpredictable, chaotic montage |
-| 1 | Pitch Sort ↑ | qsort by frequency ascending | Scatter | Low-to-high frequency sweep |
-| 2 | Pitch Sort ↓ | qsort by frequency descending | Scatter | High-to-low frequency sweep |
-| 3 | Density ↑ | qsort by amplitude ascending | Curve | Quiet-to-loud crescendo |
-| 4 | Time Warp | Original order, variable speed | Drift | Rhythmic distortion/stretch |
-| 5 | Density Arp | Density-sorted with cycling pattern | Arp Pattern | Cascading rhythmic density |
-| 6 | Deltarupt | Density-sorted, exponential attack + instant cut | Attack | Tape cut / reverse percussion |
+| 0 | Random Remix | Bias-controlled shuffle | Shfl Bias | Unpredictable → constrained montage |
+| 1 | Pitch Sort ↑ | Freq quantization + ascending sort | Pitch Win | Strict → chunky pitch sweep |
+| 2 | Pitch Sort ↓ | Octave-folded descending sort | Oct Fold | Raw freq → harmonic/inharmonic |
+| 3 | Density ↑ | Amplitude sort + curve shaping | Dens Crv | Linear → sigmoid → exponential crescendo |
+| 4 | Time Warp | Original order, amplitude^exp speed | Spd Curve | Gentle → extreme speed variation |
+| 5 | Density Arp | Density-sorted with cycling pattern | Arp Ptrn | 6 rhythmic density patterns |
+| 6 | Deltarupt | Density-sorted, quadratic attack + cut | Attack | Tape cut / reverse percussion |
+| 7 | Spec Warp | lerp(freq, amplitude, morph) sort | Morphing | Pitch-sorting ↔ density-sorting |
 
 ### Arp Pattern sub-modes (Mode 5, Knob 8)
 
@@ -124,6 +126,16 @@ Audio In (stereo int16)
 | 4 | Random | Shuffled density order (chaos) |
 | 5 | Cascade | Jump to loudest, then descend (waterfall) |
 
+### Octave Fold sub-modes (Mode 2, Knob 8)
+
+| Value | Name | Effect |
+|-------|------|--------|
+| 0 | None | Raw frequency descending sort |
+| 1 | 1 Oct | Fold all to single octave, sort by pitch class |
+| 2 | Mirror | Reflect around octave boundaries |
+| 3 | Harmonic | Collapse to fundamental harmonic series |
+| 4 | Inharm | Golden-ratio inharmonic spread |
+
 ### Deltarupt envelope detail (Mode 6)
 
 - Attack phase: quadratic curve `window = phase²` (smooth, organic rise)
@@ -133,15 +145,23 @@ Audio In (stereo int16)
 - Attack = 0.6: blooming ambient texture
 - Attack = 1.0: full grain duration is the attack (extreme bloom)
 
+### Spectral Density Warp detail (Mode 7)
+
+- Normalizes frequency and amplitude to [0,1] across all detected events
+- Sort key = lerp(freq_normalized, amp_normalized, morphing)
+- Morphing = 0.0: behaves like Mode 1 (pitch ascending)
+- Morphing = 0.5: hybrid frequency-density landscape
+- Morphing = 1.0: behaves like Mode 3 (density ascending)
+
 ---
 
 ## Open questions
 
-- [ ] Multi-page knob layout? Current design uses 1 page × 8 knobs. Boris uses 4 pages × 8 knobs — could expand later with advanced params (e.g. event spacing, window shape, spectral resolution).
-- [ ] Jog wheel: currently unused. Could map to mode selection (freeing Knob 7) or grain scrubbing.
-- [ ] FFT-based spectral analysis: Phase 2 improvement over ZCR — scope and priority TBD.
-- [ ] ui_chain.js: not yet designed — needed for Shadow UI integration.
-- [ ] Preset system: save/recall parameter snapshots? Deferred to post-MVP.
+- [x] ~~Multi-page knob layout~~ — Not needed. 8 knobs on 1 page covers all params.
+- [x] ~~Jog wheel~~ — Standard behavior (cycles through parameters in the menu).
+- [x] ~~FFT-based spectral analysis~~ — Implemented with pffft (256-point real FFT + parabolic interpolation).
+- [x] ~~ui_chain.js~~ — Implemented: dynamic Knob 8 label/value/range per mode, mode subheader, jog menu.
+- [x] ~~Preset system~~ — Not planned.
 
 ---
 
@@ -165,3 +185,9 @@ Audio In (stereo int16)
 > (musique concrete). It's intended to work on the Move-Everything framework."
 >
 > — Original design prompt, 2025-03-06
+>
+> v0.2.0 expansion: Knob 8 rework (unique parameter per mode) + Mode 7
+> (Spectral Density Warp). Inspired by Unfiltered Audio SpecOps spectral
+> bin analysis and experimental FX techniques.
+>
+> — Design conversation, 2026-03-12
