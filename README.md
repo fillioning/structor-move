@@ -63,7 +63,7 @@ CROSS_PREFIX=aarch64-linux-gnu- ./scripts/build.sh
 
 - DSP: Original (fillioning)
 - FFT: [PFFFT](https://bitbucket.org/jpommier/pffft) (BSD-like)
-- Isolator3 filter: Inspired by Octocosme DJ filter (fillioning)
+- Isolator3 filter: Based on [Airwindows Isolator3](https://github.com/airwindows/airwindows) by Chris Johnson (MIT)
 - Framework: [Move Everything](https://github.com/charlesvestal/move-anything)
 
 ## License
