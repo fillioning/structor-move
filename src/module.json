@@ -1,0 +1,40 @@
+{
+    "id": "structor",
+    "name": "Structor",
+    "abbrev": "STRCT",
+    "version": "0.1.0",
+    "description": "Musique concrète sound deconstructor/reconstructor",
+    "author": "fillioning",
+    "dsp": "structor.so",
+    "ui_chain": "ui_chain.js",
+    "api_version": 2,
+    "component_type": "audio_fx",
+    "capabilities": {
+        "chainable": true,
+        "component_type": "audio_fx",
+        "audio_in": true,
+        "ui_hierarchy": {
+            "modes": null,
+            "levels": {
+                "root": {
+                    "name": "Structor",
+                    "knobs": ["envelope", "density", "grain_size", "time_warp", "feedback", "mode", "Special", "mix"],
+                    "params": [
+                        {"level": "Structor", "label": "Structor"},
+                        {"level": "Randomize", "label": "Randomize"}
+                    ]
+                },
+                "Structor": {
+                    "label": "Structor",
+                    "knobs": ["envelope", "density", "grain_size", "time_warp", "feedback", "mode", "Special", "mix"],
+                    "params": ["envelope", "density", "grain_size", "time_warp", "feedback", "mode", "Special", "mix"]
+                },
+                "Randomize": {
+                    "label": "Randomize",
+                    "knobs": ["rnd_envelope", "rnd_density", "rnd_grain", "rnd_time", "rnd_pan", "seq_on", "seq_time", "seq_mult"],
+                    "params": ["rnd_envelope", "rnd_density", "rnd_grain", "rnd_time", "rnd_pan", "seq_on", "seq_time", "seq_mult", "detection", "rnd_filter"]
+                }
+            }
+        }
+    }
+}
