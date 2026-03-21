@@ -11,7 +11,7 @@ if [ ! -f "$MODULE_DIR/structor.so" ]; then
 fi
 
 echo "Installing Structor to $MOVE_IP..."
-DEST="/data/UserData/move-anything/modules/audio_fx/structor"
+DEST="/data/UserData/schwung/modules/audio_fx/structor"
 ssh root@$MOVE_IP "mkdir -p $DEST"
 scp "$MODULE_DIR/structor.so" "$MODULE_DIR/module.json" "$MODULE_DIR/ui_chain.js" "$MODULE_DIR/help.json" root@$MOVE_IP:$DEST/
 ssh root@$MOVE_IP "chown -R ableton:users $DEST"
