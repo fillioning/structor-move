@@ -2,7 +2,7 @@
 
 Musique concrete-inspired sound deconstructor/reconstructor for Ableton Move.
 
-An audio FX plugin for the [Move Everything](https://github.com/charlesvestal/move-everything) framework. Deconstructs audio into detected events (onsets, peaks, zero-crossings) and reconstructs them in 8 algorithmic modes with per-grain LP/HP filtering, randomization, and a sequencer for random parameters.
+An audio FX plugin for the [Schwung](https://github.com/charlesvestal/move-everything) framework. Deconstructs audio into detected events (onsets, peaks, zero-crossings) and reconstructs them in 8 algorithmic modes with per-grain LP/HP filtering, randomization, and a sequencer for random parameters.
 
 Original DSP — envelope follower + FFT spectral analysis (PFFFT) + grain-based reconstruction.
 
@@ -64,7 +64,7 @@ CROSS_PREFIX=aarch64-linux-gnu- ./scripts/build.sh
 - DSP: Original (fillioning)
 - FFT: [PFFFT](https://bitbucket.org/jpommier/pffft) (BSD-like)
 - Isolator3 filter: Based on [Airwindows Isolator3](https://github.com/airwindows/airwindows) by Chris Johnson (MIT)
-- Framework: [Move Everything](https://github.com/charlesvestal/move-anything)
+- Framework: [Schwung](https://github.com/charlesvestal/move-anything)
 
 ## License
 
