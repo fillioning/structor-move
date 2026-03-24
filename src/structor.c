@@ -1,6 +1,6 @@
 /*
  * Structor — Musique concrète sound deconstructor/reconstructor
- * Audio FX for Ableton Move via Move-Anything (audio_fx_api_v2)
+ * Audio FX for Ableton Move via Schwung (audio_fx_api_v2)
  *
  * Original DSP: envelope follower + onset/peak/ZC detection → mode-dependent
  * reordering → grain-based reconstruction with Hann/Deltarupt envelopes.
@@ -18,7 +18,7 @@
 #define FFT_SIZE 256
 
 /* ========================================================================
-   Move-Anything API (must match chain_host ABI exactly)
+   Schwung API (must match chain_host ABI exactly)
    ======================================================================== */
 
 typedef int (*move_mod_emit_value_fn)(void *ctx,

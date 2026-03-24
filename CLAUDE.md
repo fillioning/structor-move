@@ -150,4 +150,4 @@ Source files: `fftpack.c`, `pffft.c`, `structor.c` (compiled together into singl
 Compiler flags: `-O2 -shared -fPIC -ffast-math -Wall`
 
 ## Release
-Use `/move-anything-release` when ready.
+Use `/schwung-release` when ready.

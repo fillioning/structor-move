@@ -2,7 +2,7 @@
     "id": "structor",
     "name": "Structor",
     "abbrev": "STRCT",
-    "version": "0.1.1",
+    "version": "0.1.2",
     "description": "Musique concrète sound deconstructor/reconstructor",
     "author": "fillioning",
     "dsp": "structor.so",
