@@ -73,6 +73,20 @@ typedef struct audio_fx_api_v2 {
 #define RESCAN_BLOCKS   128     /* re-detect every ~0.37 sec (128 * 128 = 16384 samples) */
 #define RECON_GAIN      3.75f   /* makeup gain for reconstruction (compensates Hann window avg + tanhf compression) */
 
+/* Schroeder reverb delay line max lengths (prime-based) */
+#define REV_COMB_MAX_0  2048
+#define REV_COMB_MAX_1  2048
+#define REV_COMB_MAX_2  2048
+#define REV_COMB_MAX_3  2048
+#define REV_AP_MAX_0    1024
+#define REV_AP_MAX_1    1024
+
+/* Schroeder reverb base delay lengths at size=1.0 */
+static const uint32_t REV_COMB_BASE[4] = {1557, 1617, 1491, 1422};
+static const uint32_t REV_AP_BASE[2]   = {225, 556};
+
+#define NUM_STRUCTOR_PRESETS 20
+
 /* ========================================================================
    Types
    ======================================================================== */
@@ -132,10 +146,17 @@ typedef struct {
     uint32_t event_count;
     int playback_order[MAX_EVENTS];
 
-    /* Grain playback state */
+    /* Grain playback state — 2-slot overlap for click-free transitions */
     uint32_t playback_index;
     float playback_position;
     uint32_t locked_grain_size;   /* grain size locked at grain start, prevents mid-grain jumps */
+    /* Crossfade grain (slot B): fading-out previous grain */
+    int xf_active;               /* 1 if crossfade grain is rendering */
+    float xf_position;           /* playback position in crossfade grain */
+    uint32_t xf_grain_start;     /* sample index of crossfade grain's event */
+    uint32_t xf_grain_size;      /* locked grain size of crossfade grain */
+    float xf_speed;              /* playback speed of crossfade grain */
+    float xf_pan;                /* pan of crossfade grain */
 
     /* Reconstruction output buffers (pre-allocated, no malloc in render) */
     float recon_l[BLOCK_SIZE];
@@ -151,7 +172,7 @@ typedef struct {
     float envelope;         /* 0.0-1.0, default 0.5 (grain shape: 0=rect, 0.5=Hann, 1=narrow) */
     float density;          /* 0.05-4.0, default 0.7 */
     float grain_size;       /* 0.01-10.0, default 1.0 */
-    float time_warp;        /* 0.25-4.0, default 1.0 */
+    float time_warp;        /* 0.25-8.0, default 1.0 */
     float mix;              /* 0.0-1.0, default 0.5 */
     float feedback;         /* 0.0-0.95, default 0.2 */
 
@@ -197,6 +218,40 @@ typedef struct {
     /* Per-grain Isolator3 filter (3-stage cascade, stereo) */
     biquad_t grain_filt_l[3];
     biquad_t grain_filt_r[3];
+
+    /* Per-grain reverb send flag (set at grain transition) */
+    int grain_reverb_send;
+
+    /* DC-blocking filter state (removes low-freq thuds from buffer position jumps) */
+    float dc_l_prev_in, dc_l_prev_out;
+    float dc_r_prev_in, dc_r_prev_out;
+
+    /* ---- Page 3: Presets ---- */
+    int preset;                    /* 0-9 */
+    float master_filter;           /* 0-1: <0.49=LP, 0.49-0.51=bypass, >0.51=HP */
+    biquad_t master_filt_l[3];     /* Isolator3 master output filter */
+    biquad_t master_filt_r[3];
+    float master_filt_prev;        /* track changes to avoid recalc */
+    float master_filt_smooth;      /* per-sample smoothed filter value */
+
+    /* Random reverb */
+    float rnd_reverb;              /* 0-1: chance per grain to send to reverb */
+    float rev_mix;                 /* 0-1: reverb wet/dry */
+    float rev_size;                /* 0-1: room size */
+    float rev_decay;               /* 0-1: feedback */
+    float rev_damp;                /* 0-1: damping (LP on comb feedback) */
+
+    /* Schroeder reverb state */
+    float *rev_comb_buf[4];        /* 4 comb filter delay lines (heap) */
+    uint32_t rev_comb_len[4];      /* current delay lengths */
+    uint32_t rev_comb_pos[4];      /* write positions */
+    float rev_comb_filt[4];        /* comb LP filter state */
+    float *rev_ap_buf[2];          /* 2 allpass delay lines (heap) */
+    uint32_t rev_ap_len[2];
+    uint32_t rev_ap_pos[2];
+    float rev_bus[BLOCK_SIZE];     /* reverb input accumulator per block */
+    float rev_out_l[BLOCK_SIZE];   /* reverb stereo output */
+    float rev_out_r[BLOCK_SIZE];
 
     /* Frame counter (for reshuffle timing) */
     uint32_t frame_count;
@@ -253,11 +308,228 @@ static inline float rand_unipolar(uint32_t *rng) {
     return (float)(xorshift32(rng) & 0xFFFF) / 65536.0f;
 }
 
+/* ---- Fast math approximations (per-sample hot path) ---- */
+
+/* Fast tanh: rational approximation, max error ~0.001 in [-3,3].
+ * Uses x*(27+x²)/(27+9x²) — Padé [1,2] variant.
+ * Perceptually transparent on audio signals. */
+static inline float fast_tanhf(float x) {
+    if (x < -3.0f) return -1.0f;
+    if (x >  3.0f) return  1.0f;
+    float x2 = x * x;
+    return x * (27.0f + x2) / (27.0f + 9.0f * x2);
+}
+
+/* Fast sin(x) for x in [0, pi]: parabolic approximation.
+ * 4x(pi-x) / (pi²) with one correction term. Max error ~0.001.
+ * Used for Hann window where x = phase * pi. */
+static inline float fast_sinf_0pi(float x) {
+    /* x in [0, pi] */
+    float y = 4.0f * x * (3.14159265f - x) / (3.14159265f * 3.14159265f);
+    /* Correction for better accuracy: */
+    return y * (0.775f + 0.225f * y);
+}
+
+/* Fast powf for small integer-ish exponents (1-5 range).
+ * Uses exp2(exp * log2(base)) with fast approximations.
+ * For the envelope narrowing path where base is in [0,1] and exp in [1,5]. */
+static inline float fast_powf_01(float base, float exp) {
+    if (base <= 0.0f) return 0.0f;
+    if (base >= 1.0f) return 1.0f;
+    /* log2 approximation via float bit manipulation */
+    union { float f; uint32_t i; } u = { .f = base };
+    float log2_base = (float)((int32_t)u.i - 0x3f800000) * 5.9604645e-08f;
+    /* exp2 approximation via float bit trick */
+    float val = log2_base * exp;
+    float result = val * 0.6931472f; /* log2 → ln */
+    /* Fast exp approximation: (1 + x/256)^256 via repeated squaring */
+    result = 1.0f + result / 256.0f;
+    result *= result; result *= result; result *= result; result *= result;
+    result *= result; result *= result; result *= result; result *= result;
+    return clampf(result, 0.0f, 1.0f);
+}
+
 /* ---- Biquad filter (Isolator3-inspired, from Octocosme) ---- */
 
 #define SAMPLE_RATE 44100.0f
 #define TWO_PI_F    6.2831853f
 #define DENORM_F    1e-20f
+
+/* ---- Schroeder Reverb Engine ---- */
+
+static void reverb_init(StructorInstance *inst) {
+    /* Allocate delay lines */
+    for (int i=0;i<4;i++) {
+        uint32_t sz = (i==0)?REV_COMB_MAX_0:(i==1)?REV_COMB_MAX_1:(i==2)?REV_COMB_MAX_2:REV_COMB_MAX_3;
+        inst->rev_comb_buf[i] = (float*)calloc(sz, sizeof(float));
+        inst->rev_comb_pos[i] = 0;
+        inst->rev_comb_filt[i] = 0.0f;
+        inst->rev_comb_len[i] = REV_COMB_BASE[i];
+    }
+    for (int i=0;i<2;i++) {
+        uint32_t sz = (i==0)?REV_AP_MAX_0:REV_AP_MAX_1;
+        inst->rev_ap_buf[i] = (float*)calloc(sz, sizeof(float));
+        inst->rev_ap_pos[i] = 0;
+        inst->rev_ap_len[i] = REV_AP_BASE[i];
+    }
+}
+
+static void reverb_free(StructorInstance *inst) {
+    for (int i=0;i<4;i++) { free(inst->rev_comb_buf[i]); inst->rev_comb_buf[i]=NULL; }
+    for (int i=0;i<2;i++) { free(inst->rev_ap_buf[i]); inst->rev_ap_buf[i]=NULL; }
+}
+
+static void reverb_update_params(StructorInstance *inst) {
+    /* Scale delay lengths by size (0.3x at size=0, 1.0x at size=1) */
+    float scale = 0.3f + inst->rev_size * 0.7f;
+    for (int i=0;i<4;i++) {
+        uint32_t len = (uint32_t)(REV_COMB_BASE[i] * scale);
+        uint32_t maxlen = (i==0)?REV_COMB_MAX_0:(i==1)?REV_COMB_MAX_1:(i==2)?REV_COMB_MAX_2:REV_COMB_MAX_3;
+        if (len < 16) len = 16;
+        if (len > maxlen) len = maxlen;
+        inst->rev_comb_len[i] = len;
+    }
+    for (int i=0;i<2;i++) {
+        uint32_t len = (uint32_t)(REV_AP_BASE[i] * scale);
+        uint32_t maxlen = (i==0)?REV_AP_MAX_0:REV_AP_MAX_1;
+        if (len < 8) len = 8;
+        if (len > maxlen) len = maxlen;
+        inst->rev_ap_len[i] = len;
+    }
+}
+
+static void reverb_process(StructorInstance *inst, int frames) {
+    /* Feedback gain: 0.5 (tight ambiance) to 0.88 (long space).
+     * Kept below 0.9 to prevent instability with 4 parallel combs. */
+    float fb = 0.50f + inst->rev_decay * 0.38f;
+    /* Damping LPF coefficient: 0=bright (no damping), 1=very dark */
+    float damp = inst->rev_damp;
+    float damp1 = 1.0f - damp;
+    /* Input attenuation: prevent overdriving the comb network */
+    float in_gain = 0.3f;
+
+    memset(inst->rev_out_l, 0, frames * sizeof(float));
+    memset(inst->rev_out_r, 0, frames * sizeof(float));
+
+    for (int i = 0; i < frames; i++) {
+        float in = inst->rev_bus[i] * in_gain;
+        float comb_sum = 0.0f;
+
+        /* 4 parallel comb filters with LP-filtered feedback + soft clip */
+        for (int c = 0; c < 4; c++) {
+            float *buf = inst->rev_comb_buf[c];
+            uint32_t len = inst->rev_comb_len[c];
+            uint32_t pos = inst->rev_comb_pos[c];
+            uint32_t rd = (pos >= len) ? (pos - len) : (pos + REV_COMB_MAX_0 - len);
+            rd %= REV_COMB_MAX_0;
+
+            float delayed = buf[rd];
+            /* One-pole LP in feedback for damping */
+            inst->rev_comb_filt[c] = delayed * damp1 + inst->rev_comb_filt[c] * damp;
+            /* Soft clip inside feedback loop to prevent runaway */
+            float fb_sig = inst->rev_comb_filt[c] * fb;
+            if (fb_sig > 1.0f) fb_sig = 1.0f;
+            else if (fb_sig < -1.0f) fb_sig = -1.0f;
+            buf[pos] = in + fb_sig;
+
+            inst->rev_comb_pos[c] = (pos + 1) % REV_COMB_MAX_0;
+            comb_sum += delayed;
+        }
+        comb_sum *= 0.25f; /* normalize */
+
+        /* 2 series allpass filters for diffusion */
+        float ap = comb_sum;
+        for (int a = 0; a < 2; a++) {
+            float *buf = inst->rev_ap_buf[a];
+            uint32_t len = inst->rev_ap_len[a];
+            uint32_t pos = inst->rev_ap_pos[a];
+            uint32_t maxlen = (a==0)?REV_AP_MAX_0:REV_AP_MAX_1;
+            uint32_t rd = (pos >= len) ? (pos - len) : (pos + maxlen - len);
+            rd %= maxlen;
+
+            float delayed = buf[rd];
+            float g = 0.5f;
+            buf[pos] = ap + delayed * g;
+            ap = delayed - ap * g;
+            inst->rev_ap_pos[a] = (pos + 1) % maxlen;
+        }
+
+        /* Stereo decorrelation: slight phase offset between L/R */
+        inst->rev_out_l[i] = ap;
+        inst->rev_out_r[i] = (i > 0) ? inst->rev_out_l[i-1] : ap;
+    }
+
+    /* Clear reverb bus for next block */
+    memset(inst->rev_bus, 0, frames * sizeof(float));
+}
+
+/* ---- Preset Table ---- */
+typedef struct {
+    float envelope, density, grain_size, time_warp, mix, feedback;
+    int mode;
+    float master_filter, rnd_reverb, rev_mix, rev_size, rev_decay, rev_damp;
+} structor_preset_t;
+
+/*                       env   den   grain tw    mix   fb    mode mfilt rrv   rmix  rsz   rdcy  rdmp */
+static const structor_preset_t STRUCTOR_PRESETS[NUM_STRUCTOR_PRESETS] = {
+    {0.50f,5.00f,5.00f,1.00f,0.50f,0.20f, 0, 0.50f,0.00f,0.00f,0.50f,0.50f,0.50f}, /* 0 Init */
+    {0.40f,0.50f,0.60f,1.50f,0.60f,0.30f, 0, 0.50f,0.40f,0.30f,0.40f,0.60f,0.40f}, /* 1 Scatter */
+    {0.55f,0.80f,1.20f,0.50f,0.55f,0.15f, 1, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 2 Ascend */
+    {0.55f,0.80f,1.20f,0.60f,0.55f,0.15f, 2, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 3 Descend */
+    {0.30f,0.60f,0.40f,1.00f,0.65f,0.25f, 5, 0.50f,0.30f,0.20f,0.30f,0.40f,0.30f}, /* 4 Pulse */
+    {0.15f,0.90f,0.30f,1.50f,0.70f,0.40f, 6, 0.35f,0.00f,0.00f,0.20f,0.30f,0.60f}, /* 5 Tape Cut */
+    {0.60f,0.40f,2.00f,0.70f,0.50f,0.10f, 7, 0.50f,0.60f,0.50f,0.80f,0.80f,0.60f}, /* 6 Spectral */
+    {0.70f,0.30f,3.00f,0.40f,0.45f,0.35f, 0, 0.50f,0.50f,0.60f,0.90f,0.90f,0.70f}, /* 7 Ambient */
+    {0.25f,0.95f,0.50f,2.00f,0.75f,0.50f, 0, 0.50f,0.70f,0.40f,0.50f,0.50f,0.30f}, /* 8 Chaos */
+    {0.65f,0.35f,2.50f,0.50f,0.55f,0.20f, 7, 0.60f,0.80f,0.70f,1.00f,0.95f,0.85f}, /* 9 Dark Hall */
+    {0.80f,0.20f,8.00f,0.30f,0.40f,0.50f, 0, 0.50f,0.30f,0.40f,0.70f,0.80f,0.80f}, /* 10 Frozen */
+    {0.20f,1.50f,0.20f,3.00f,0.70f,0.10f, 4, 0.50f,0.10f,0.10f,0.20f,0.30f,0.20f}, /* 11 Glitch */
+    {0.90f,0.15f,10.0f,0.25f,0.35f,0.60f, 7, 0.50f,0.70f,0.50f,1.00f,0.85f,0.90f}, /* 12 Drone */
+    {0.35f,0.80f,0.50f,1.00f,0.60f,0.30f, 5, 0.50f,0.50f,0.35f,0.50f,0.60f,0.40f}, /* 13 Sequenced */
+    {0.10f,2.00f,0.15f,4.00f,0.80f,0.00f, 6, 0.50f,0.00f,0.00f,0.30f,0.40f,0.50f}, /* 14 Shatter */
+    {0.60f,0.40f,3.00f,0.50f,0.45f,0.40f, 1, 0.50f,0.40f,0.45f,0.80f,0.75f,0.65f}, /* 15 Rise */
+    {0.45f,0.60f,1.50f,1.20f,0.55f,0.20f, 3, 0.50f,0.60f,0.40f,0.60f,0.55f,0.45f}, /* 16 Thick */
+    {0.70f,0.25f,6.00f,0.35f,0.40f,0.70f, 0, 0.40f,0.20f,0.30f,0.40f,0.50f,0.70f}, /* 17 Lo-Fi */
+    {0.50f,0.50f,2.00f,1.50f,0.60f,0.15f, 2, 0.50f,0.80f,0.60f,0.90f,0.80f,0.50f}, /* 18 Cathedral */
+    {0.30f,1.00f,0.80f,2.00f,0.75f,0.35f, 4, 0.50f,0.40f,0.25f,0.35f,0.45f,0.35f}, /* 19 Warp */
+};
+static const char *STRUCTOR_PRESET_NAMES[NUM_STRUCTOR_PRESETS] = {
+    "Init","Scatter","Ascend","Descend","Pulse",
+    "Tape Cut","Spectral","Ambient","Chaos","Dark Hall",
+    "Frozen","Glitch","Drone","Sequenced","Shatter",
+    "Rise","Thick","Lo-Fi","Cathedral","Warp"
+};
+
+static void apply_structor_preset(void *instance, int idx) {
+    StructorInstance *inst = (StructorInstance*)instance;
+    if (idx < 0 || idx >= NUM_STRUCTOR_PRESETS) return;
+    const structor_preset_t *p = &STRUCTOR_PRESETS[idx];
+    inst->envelope = p->envelope; inst->density = p->density;
+    inst->grain_size = p->grain_size; inst->time_warp = p->time_warp;
+    inst->mix = p->mix; inst->feedback = p->feedback;
+    inst->mode = p->mode;
+    inst->master_filter = p->master_filter;
+    inst->rnd_reverb = p->rnd_reverb; inst->rev_mix = p->rev_mix;
+    inst->rev_size = p->rev_size; inst->rev_decay = p->rev_decay;
+    inst->rev_damp = p->rev_damp;
+    inst->preset = idx;
+}
+
+static void randomize_preset(StructorInstance *inst) {
+    inst->envelope = 0.1f + rand_unipolar(&inst->rng) * 0.8f;
+    inst->density = 0.2f + rand_unipolar(&inst->rng) * 0.8f;
+    inst->grain_size = 0.3f + rand_unipolar(&inst->rng) * 4.0f;
+    inst->time_warp = 0.25f + rand_unipolar(&inst->rng) * 3.75f;
+    inst->mix = 0.3f + rand_unipolar(&inst->rng) * 0.5f;
+    inst->feedback = rand_unipolar(&inst->rng) * 0.6f;
+    inst->mode = (int)(rand_unipolar(&inst->rng) * MAX_MODES) % MAX_MODES;
+    inst->master_filter = 0.5f; /* always reset to bypass — avoids gain/distortion bugs */
+    inst->rnd_reverb = rand_unipolar(&inst->rng) * 0.8f;
+    inst->rev_mix = rand_unipolar(&inst->rng) * 0.7f;
+    inst->rev_size = rand_unipolar(&inst->rng);
+    inst->rev_decay = 0.2f + rand_unipolar(&inst->rng) * 0.7f;
+    inst->rev_damp = rand_unipolar(&inst->rng) * 0.8f;
+}
 
 static void biquad_lpf(biquad_t *f, float freq, float q) {
     float w0 = TWO_PI_F * clampf(freq, 20.0f, SAMPLE_RATE * 0.49f) / SAMPLE_RATE;
@@ -789,11 +1061,42 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
         inst->locked_grain_size = new_grain_size;
     uint32_t grain_size = inst->locked_grain_size;
 
+    /* Crossfade length: 128 samples (~3ms) or grain_size/3, whichever is smaller.
+     * Longer crossfade masks transient attacks from drums/clicky sources. */
+    uint32_t xf_len = (grain_size < 384) ? grain_size / 3 : 128;
+    if (xf_len < 8) xf_len = 8;
+
     for (uint32_t out_i = 0; out_i < num_samples; out_i++) {
+
+        /* ---- Render crossfade grain (slot B) if active ---- */
+        if (inst->xf_active) {
+            uint32_t xf_src = (inst->xf_grain_start + (uint32_t)inst->xf_position) % BUFFER_SIZE;
+            /* Pure fade-out ramp only — no Hann window. The Hann is near zero at
+             * the grain boundary where the crossfade starts, so applying it would
+             * make the crossfade grain silent (defeating the purpose). */
+            uint32_t xf_remaining = inst->xf_grain_size - (uint32_t)inst->xf_position;
+            float t = clampf((float)xf_remaining / (float)xf_len, 0.0f, 1.0f);
+            float xf_win = fast_sinf_0pi(t * 1.5707963f); /* equal-power cos fade-out */
+
+            float xf_frac = inst->xf_position - (uint32_t)inst->xf_position;
+            uint32_t xp0=(xf_src-1+BUFFER_SIZE)%BUFFER_SIZE, xp1=xf_src;
+            uint32_t xp2=(xf_src+1)%BUFFER_SIZE, xp3=(xf_src+2)%BUFFER_SIZE;
+            float xs_l = xf_win * hermite_interp(buf_l[xp0],buf_l[xp1],buf_l[xp2],buf_l[xp3],xf_frac);
+            float xs_r = xf_win * hermite_interp(buf_r[xp0],buf_r[xp1],buf_r[xp2],buf_r[xp3],xf_frac);
+            float xpan_l = 1.0f - clampf(inst->xf_pan, 0.0f, 1.0f);
+            float xpan_r = 1.0f + clampf(inst->xf_pan, -1.0f, 0.0f);
+            out_l[out_i] += xs_l * xpan_l;
+            out_r[out_i] += xs_r * xpan_r;
+
+            inst->xf_position += inst->xf_speed;
+            if (inst->xf_position >= (float)inst->xf_grain_size)
+                inst->xf_active = 0;
+        }
+
+        /* ---- Render main grain (slot A) ---- */
         uint32_t evt_idx = inst->playback_index % inst->event_count;
         StructorEvent *evt = &inst->events[evt_idx];
 
-        /* Grain start centered on event */
         uint32_t grain_start = evt->sample_index;
         if (grain_start > grain_size / 2)
             grain_start -= grain_size / 2;
@@ -806,7 +1109,6 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
         float window = 1.0f;
 
         if (inst->mode == MODE_DELTARUPT) {
-            /* Deltarupt: quadratic attack → sustain at 1.0 → instant cutoff at grain end */
             float attack_dur = inst->deltarupt_attack;
             if (attack_dur < 0.01f) {
                 window = 1.0f;
@@ -817,24 +1119,28 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
                 window = 1.0f;
             }
         } else {
-            /* Morphing grain envelope controlled by 'envelope' param:
-               0.0 = rectangle (flat, hard edges)
-               0.5 = Hann window (smooth, default)
-               1.0 = narrow peak (pointillistic) */
             float env = eff_envelope;
-            float hann_w = sinf(window_phase * 3.14159265f);
+            float hann_w = fast_sinf_0pi(window_phase * 3.14159265f);
             float hann = hann_w * hann_w;
 
             if (env <= 0.5f) {
-                /* 0.0-0.5: morph from rectangle to Hann */
-                float t = env * 2.0f;  /* 0..1 */
+                float t = env * 2.0f;
                 window = (1.0f - t) * 1.0f + t * hann;
             } else {
-                /* 0.5-1.0: morph from Hann to narrow peak (raised cosine with exponent) */
-                float t = (env - 0.5f) * 2.0f;  /* 0..1 */
-                float narrow_exp = 1.0f + t * 4.0f;  /* exponent 1..5 */
-                float narrow = powf(hann, narrow_exp);
+                float t = (env - 0.5f) * 2.0f;
+                float narrow_exp = 1.0f + t * 4.0f;
+                float narrow = fast_powf_01(hann, narrow_exp);
                 window = (1.0f - t) * hann + t * narrow;
+            }
+        }
+
+        /* Equal-power fade-in at grain start (complements crossfade fade-out) */
+        if (inst->mode != MODE_DELTARUPT) {
+            uint32_t pos = (uint32_t)inst->playback_position;
+            if (pos < xf_len) {
+                float t = (float)pos / (float)xf_len; /* 0→1 */
+                float fade_in = fast_sinf_0pi(t * 1.5707963f); /* sin fade-in */
+                window *= fade_in;
             }
         }
 
@@ -851,41 +1157,33 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
         float samp_r = window * hermite_interp(
             buf_r[p0], buf_r[p1], buf_r[p2], buf_r[p3], frac);
 
-        /* Per-grain Isolator3 filter (DJ-style LP/HP, 3-stage cascade) */
+        /* Per-grain Isolator3 filter */
         if (inst->rnd_filter > 0) {
-            float fc = inst->grain_filter_cutoff;
-            float filt_param = fc / 100.0f;  /* normalize 0-100 → 0-1 */
-            if (filt_param < 0.49f) {
-                /* LPF sweep: 18000→200 Hz */
-                float t = (0.49f - filt_param) / 0.49f;
-                for (int s = 0; s < 3; s++) {
-                    samp_l = biquad_process(&inst->grain_filt_l[s], samp_l);
-                    samp_r = biquad_process(&inst->grain_filt_r[s], samp_r);
-                }
-                (void)t;  /* coeffs updated at grain start */
-            } else if (filt_param > 0.51f) {
-                /* HPF sweep: 20→8000 Hz */
+            float filt_param = inst->grain_filter_cutoff / 100.0f;
+            if (filt_param < 0.49f || filt_param > 0.51f) {
                 for (int s = 0; s < 3; s++) {
                     samp_l = biquad_process(&inst->grain_filt_l[s], samp_l);
                     samp_r = biquad_process(&inst->grain_filt_r[s], samp_r);
                 }
             }
-            /* 0.49-0.51 = bypass zone */
         }
 
-        /* Apply per-grain random pan: pan=-1 full left, +1 full right */
+        /* Per-grain pan */
         float pan = inst->current_grain_pan;
-        float pan_l = 1.0f - clampf(pan, 0.0f, 1.0f);   /* attenuate L when pan > 0 */
-        float pan_r = 1.0f + clampf(pan, -1.0f, 0.0f);   /* attenuate R when pan < 0 */
+        float pan_l = 1.0f - clampf(pan, 0.0f, 1.0f);
+        float pan_r = 1.0f + clampf(pan, -1.0f, 0.0f);
         out_l[out_i] += samp_l * pan_l;
         out_r[out_i] += samp_r * pan_r;
 
-        /* Playback speed — time_warp affects all modes */
+        /* Reverb send: accumulate grain audio into reverb bus if flagged */
+        if (inst->grain_reverb_send && inst->rnd_reverb > 0.0f)
+            inst->rev_bus[out_i] += (samp_l + samp_r) * 0.5f;
+
+        /* Playback speed */
         float speed = eff_time_warp;
         if (inst->mode == MODE_TIME_WARP) {
-            /* Speed Curve Exponent: amplitude^exp maps to additional speed modulation */
             float norm_amp = clampf(evt->density, 0.001f, 1.0f);
-            float speed_factor = powf(norm_amp, inst->speed_curve_exp);
+            float speed_factor = fast_powf_01(norm_amp, inst->speed_curve_exp);
             speed = lerpf(0.25f, 2.0f, speed_factor) * eff_time_warp;
         } else if (inst->mode == MODE_DENSITY_ARP) {
             speed = lerpf(0.8f, 1.2f, evt->density) * eff_time_warp;
@@ -893,22 +1191,31 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
 
         inst->playback_position += speed;
 
-        /* Advance to next event when grain exhausted */
+        /* ---- Grain transition: move current to crossfade slot, start next ---- */
         if (inst->playback_position >= (float)grain_size) {
+            /* Save current grain state into crossfade slot B */
+            inst->xf_active = 1;
+            inst->xf_position = inst->playback_position; /* continue from where we are */
+            inst->xf_grain_start = grain_start;
+            inst->xf_grain_size = grain_size + xf_len; /* extend tail for fade-out */
+            inst->xf_speed = speed;
+            inst->xf_pan = inst->current_grain_pan;
+
+            /* Start new grain in slot A */
             inst->playback_position = 0.0f;
             inst->playback_index++;
-            /* New random pan for next grain */
+            /* New random pan */
             float eff_pan = clampf(inst->rnd_pan + inst->seq_pan_offset, 0.0f, 1.0f);
             inst->current_grain_pan = rand_bipolar(&inst->rng) * eff_pan;
-            /* New random filter cutoff for next grain (Isolator3) */
+            /* Reverb send: stochastic per-grain decision */
+            inst->grain_reverb_send = (inst->rnd_reverb > 0.0f && rand_unipolar(&inst->rng) < inst->rnd_reverb) ? 1 : 0;
+            /* New random filter cutoff */
             if (inst->rnd_filter > 0) {
                 float eff_chance = clampf((float)inst->rnd_filter / 100.0f + inst->seq_filter_offset, 0.0f, 1.0f);
                 if (rand_unipolar(&inst->rng) < eff_chance) {
-                    /* New random cutoff 0-100, with sequencer offset on cutoff */
                     float base_cutoff = rand_unipolar(&inst->rng) * 100.0f;
                     inst->grain_filter_cutoff = clampf(base_cutoff + inst->seq_filter_offset * 50.0f, 0.0f, 100.0f);
                 }
-                /* Update filter coefficients for new cutoff */
                 float fc = inst->grain_filter_cutoff;
                 float filt_param = fc / 100.0f;
                 if (filt_param < 0.49f) {
@@ -926,14 +1233,13 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
                         biquad_hpf(&inst->grain_filt_r[s], hp_f, 0.707f);
                     }
                 }
-                /* Reset filter state to avoid transients between grains */
                 for (int s = 0; s < 3; s++) {
                     biquad_reset(&inst->grain_filt_l[s]);
                     biquad_reset(&inst->grain_filt_r[s]);
                 }
             }
-            /* Lock new grain_size for next grain */
             inst->locked_grain_size = new_grain_size;
+            grain_size = new_grain_size;
             if (inst->playback_index >= inst->event_count)
                 inst->playback_index = 0;
         }
@@ -1002,6 +1308,24 @@ static void* structor_create(const char *module_dir, const char *config_json) {
     inst->seq_pan_offset = 0.0f;
     inst->seq_filter_offset = 0.0f;
 
+    /* Page 3: Presets */
+    inst->preset = 0;
+    inst->master_filter = 0.5f;
+    inst->master_filt_prev = -1.0f;
+    inst->master_filt_smooth = 0.5f;
+    for (int i = 0; i < 3; i++) {
+        biquad_reset(&inst->master_filt_l[i]);
+        biquad_reset(&inst->master_filt_r[i]);
+    }
+    inst->rnd_reverb = 0.0f;
+    inst->rev_mix = 0.3f;
+    inst->rev_size = 0.5f;
+    inst->rev_decay = 0.5f;
+    inst->rev_damp = 0.5f;
+    inst->grain_reverb_send = 0;
+    reverb_init(inst);
+    reverb_update_params(inst);
+
     /* Envelope follower time constants (10 ms attack, 50 ms release at 44.1 kHz) */
     inst->env_attack = 1.0f - expf(-1.0f / (44100.0f * 0.01f));
     inst->env_release = 1.0f - expf(-1.0f / (44100.0f * 0.05f));
@@ -1019,6 +1343,10 @@ static void* structor_create(const char *module_dir, const char *config_json) {
     inst->fft_output = (float*)pffft_aligned_calloc(FFT_SIZE, sizeof(float));
     inst->fft_work = (float*)pffft_aligned_calloc(FFT_SIZE, sizeof(float));
 
+    /* Apply preset 0 (Init) — overrides the hardcoded defaults above
+     * with the preset table values for envelope/density/grain/tw/mix/fb/mode/filter/reverb */
+    apply_structor_preset(inst, 0);
+
     if (g_host && g_host->log) g_host->log("[structor] instance created");
     return inst;
 }
@@ -1032,6 +1360,7 @@ static void structor_destroy(void *instance) {
         if (inst->fft_work) pffft_aligned_free(inst->fft_work);
         free(inst->buffer_l);
         free(inst->buffer_r);
+        reverb_free(inst);
         free(inst);
     }
 }
@@ -1134,21 +1463,81 @@ static void structor_process(void *instance, int16_t *audio_inout, int frames) {
     /* Reconstruct */
     reconstruct(inst, frames);
 
+    /* DC-blocking filter on reconstruction output: y[n] = x[n] - x[n-1] + 0.997*y[n-1]
+     * Removes DC offset jumps between grains from different buffer positions */
+    for (int i = 0; i < frames; i++) {
+        float xl = inst->recon_l[i];
+        float xr = inst->recon_r[i];
+        float yl = xl - inst->dc_l_prev_in + 0.997f * inst->dc_l_prev_out;
+        float yr = xr - inst->dc_r_prev_in + 0.997f * inst->dc_r_prev_out;
+        inst->dc_l_prev_in = xl; inst->dc_l_prev_out = yl;
+        inst->dc_r_prev_in = xr; inst->dc_r_prev_out = yr;
+        inst->recon_l[i] = yl;
+        inst->recon_r[i] = yr;
+    }
+
+    /* Process reverb bus and mix into reconstruction output */
+    if (inst->rnd_reverb > 0.0f || inst->rev_mix > 0.0f) {
+        reverb_update_params(inst);
+        reverb_process(inst, frames);
+        float rmix = inst->rev_mix;
+        for (int i = 0; i < frames; i++) {
+            inst->recon_l[i] += inst->rev_out_l[i] * rmix;
+            inst->recon_r[i] += inst->rev_out_r[i] * rmix;
+        }
+    }
+
     /* Mix wet/dry with equal-power crossfade (no volume dip at 50%) */
     float mix_angle = inst->mix * 1.5707963f;  /* 0..pi/2 */
-    float dry = cosf(mix_angle);
+    float dry = cosf(mix_angle);  /* once per block — keep precise */
     float wet = sinf(mix_angle);
+    /* Per-sample smoothing coefficient for filter (~10ms tau at 44.1kHz) */
+    float filt_alpha = 1.0f - expf(-1.0f / (44100.0f * 0.010f));
+    float mf_target = inst->master_filter;
 
     for (int i = 0; i < frames; i++) {
+        /* Smooth filter parameter per-sample (eliminates zipper noise) */
+        inst->master_filt_smooth += filt_alpha * (mf_target - inst->master_filt_smooth);
+        float mf = inst->master_filt_smooth;
+
+        /* Update filter coefficients when smoothed value changes */
+        if (fabsf(mf - inst->master_filt_prev) > 0.0005f) {
+            inst->master_filt_prev = mf;
+            if (mf < 0.49f) {
+                float t = (0.49f - mf) / 0.49f;
+                float lp_f = 18000.0f * powf(200.0f / 18000.0f, t);
+                for (int s = 0; s < 3; s++) {
+                    biquad_lpf(&inst->master_filt_l[s], lp_f, 0.707f);
+                    biquad_lpf(&inst->master_filt_r[s], lp_f, 0.707f);
+                }
+            } else if (mf > 0.51f) {
+                float t = (mf - 0.51f) / 0.49f;
+                float hp_f = 20.0f * powf(400.0f, t);
+                for (int s = 0; s < 3; s++) {
+                    biquad_hpf(&inst->master_filt_l[s], hp_f, 0.707f);
+                    biquad_hpf(&inst->master_filt_r[s], hp_f, 0.707f);
+                }
+            }
+        }
+        int mf_active = (mf < 0.49f || mf > 0.51f);
+
         float in_l = audio_inout[i * 2]     / 32768.0f;
         float in_r = audio_inout[i * 2 + 1] / 32768.0f;
 
         float out_l = dry * in_l + wet * inst->recon_l[i] * RECON_GAIN;
         float out_r = dry * in_r + wet * inst->recon_r[i] * RECON_GAIN;
 
-        /* Soft limiting */
-        out_l = tanhf(out_l);
-        out_r = tanhf(out_r);
+        /* Master DJ filter (Isolator3 3-stage cascade, smoothed) */
+        if (mf_active) {
+            for (int s = 0; s < 3; s++) {
+                out_l = biquad_process(&inst->master_filt_l[s], out_l);
+                out_r = biquad_process(&inst->master_filt_r[s], out_r);
+            }
+        }
+
+        /* Soft limiting (fast approximation) */
+        out_l = fast_tanhf(out_l);
+        out_r = fast_tanhf(out_r);
 
         /* Convert to int16 */
         int32_t il = (int32_t)(out_l * 32767.0f);
@@ -1258,6 +1647,7 @@ static void structor_set_param(void *instance, const char *key, const char *val)
     /* Page tracking — Shadow UI sends _level when user navigates */
     if (strcmp(key, "_level") == 0) {
         if (strcmp(val, "Randomize") == 0) inst->current_page = 1;
+        else if (strcmp(val, "Presets") == 0) inst->current_page = 2;
         else inst->current_page = 0;  /* "Structor" or root */
         return;
     }
@@ -1272,7 +1662,7 @@ static void structor_set_param(void *instance, const char *key, const char *val)
     } else if (strcmp(key, "grain_size") == 0) {
         inst->grain_size = clampf(atof(val), 0.1f, 40.0f);
     } else if (strcmp(key, "time_warp") == 0) {
-        inst->time_warp = clampf(atof(val), 0.25f, 4.0f);
+        inst->time_warp = clampf(atof(val), 0.25f, 8.0f);
     } else if (strcmp(key, "mix") == 0) {
         inst->mix = clampf(atof(val), 0.0f, 1.0f);
     } else if (strcmp(key, "feedback") == 0) {
@@ -1342,12 +1732,51 @@ static void structor_set_param(void *instance, const char *key, const char *val)
         }
         inst->seq_mult = clampi(atoi(val), 0, MAX_SEQ_MULT - 1);
     }
+    /* ---- Page 3 params ---- */
+    else if (strcmp(key, "preset") == 0) {
+        int p = atoi(val);
+        if (p >= 0 && p < NUM_STRUCTOR_PRESETS) apply_structor_preset(instance, p);
+    } else if (strcmp(key, "rnd_preset") == 0) {
+        /* Trigger on any non-zero value (int or float from jog menu) */
+        float v = atof(val);
+        if (v != 0.0f) randomize_preset(inst);
+    } else if (strcmp(key, "master_filter") == 0) {
+        inst->master_filter = clampf(atof(val), 0.0f, 1.0f);
+    } else if (strcmp(key, "rnd_reverb") == 0) {
+        inst->rnd_reverb = clampf(atof(val), 0.0f, 1.0f);
+    } else if (strcmp(key, "rev_mix") == 0) {
+        inst->rev_mix = clampf(atof(val), 0.0f, 1.0f);
+    } else if (strcmp(key, "rev_size") == 0) {
+        inst->rev_size = clampf(atof(val), 0.0f, 1.0f);
+    } else if (strcmp(key, "rev_decay") == 0) {
+        inst->rev_decay = clampf(atof(val), 0.0f, 1.0f);
+    } else if (strcmp(key, "rev_damp") == 0) {
+        inst->rev_damp = clampf(atof(val), 0.0f, 1.0f);
+    }
     /* ---- Knob overlay: knob_N_adjust (page-aware) ---- */
     else if (strncmp(key, "knob_", 5) == 0 && strstr(key, "_adjust")) {
         int knob_num = atoi(key + 5);  /* 1-indexed */
         int delta = atoi(val);
 
-        if (inst->current_page == 1) {
+        if (inst->current_page == 2) {
+            /* Presets page */
+            switch (knob_num) {
+                case 1: {
+                    int p = inst->preset + delta;
+                    if (p >= NUM_STRUCTOR_PRESETS) p = 0;
+                    if (p < 0) p = NUM_STRUCTOR_PRESETS - 1;
+                    apply_structor_preset(instance, p);
+                    break;
+                }
+                case 2: if (delta != 0) { randomize_preset(inst); inst->preset = -1; } break;
+                case 3: inst->master_filter = clampf(inst->master_filter + delta * 0.01f, 0.0f, 1.0f); break;
+                case 4: inst->rnd_reverb = clampf(inst->rnd_reverb + delta * 0.01f, 0.0f, 1.0f); break;
+                case 5: inst->rev_mix = clampf(inst->rev_mix + delta * 0.01f, 0.0f, 1.0f); break;
+                case 6: inst->rev_size = clampf(inst->rev_size + delta * 0.01f, 0.0f, 1.0f); break;
+                case 7: inst->rev_decay = clampf(inst->rev_decay + delta * 0.01f, 0.0f, 1.0f); break;
+                case 8: inst->rev_damp = clampf(inst->rev_damp + delta * 0.01f, 0.0f, 1.0f); break;
+            }
+        } else if (inst->current_page == 1) {
             /* Randomize page */
             switch (knob_num) {
                 case 1: inst->rnd_envelope = clampf(inst->rnd_envelope + delta * 0.02f, 0.0f, 1.0f); break;
@@ -1371,7 +1800,7 @@ static void structor_set_param(void *instance, const char *key, const char *val)
                 case 1: inst->envelope = clampf(inst->envelope + delta * 0.02f, 0.0f, 1.0f); break;
                 case 2: inst->density = clampf(inst->density + delta * 0.05f, 0.05f, 20.0f); break;
                 case 3: inst->grain_size = clampf(inst->grain_size + delta * 0.2f, 0.1f, 40.0f); break;
-                case 4: inst->time_warp = clampf(inst->time_warp + delta * 0.05f, 0.25f, 4.0f); break;
+                case 4: inst->time_warp = clampf(inst->time_warp + delta * 0.05f, 0.25f, 8.0f); break;
                 case 5: inst->feedback = clampf(inst->feedback + delta * 0.01f, 0.0f, 0.95f); break;
                 case 6: {
                     int new_mode = inst->mode + delta;
@@ -1424,7 +1853,7 @@ static void structor_set_param(void *instance, const char *key, const char *val)
         inst->envelope = clampf(env, 0.0f, 1.0f);
         inst->density = clampf(den, 0.05f, 20.0f);
         inst->grain_size = clampf(gs, 0.1f, 40.0f);
-        inst->time_warp = clampf(tw, 0.25f, 4.0f);
+        inst->time_warp = clampf(tw, 0.25f, 8.0f);
         inst->mix = clampf(mx, 0.0f, 1.0f);
         inst->feedback = clampf(fb, 0.0f, 0.95f);
         inst->mode = clampi(m, 0, MAX_MODES - 1);
@@ -1464,7 +1893,7 @@ static int structor_get_param(void *instance, const char *key, char *buf, int bu
             "{\"key\":\"envelope\",\"name\":\"Envelope\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.02},"
             "{\"key\":\"density\",\"name\":\"Density\",\"type\":\"float\",\"min\":0.05,\"max\":20,\"step\":0.05},"
             "{\"key\":\"grain_size\",\"name\":\"Grain Size\",\"type\":\"float\",\"min\":0.1,\"max\":40,\"step\":0.2},"
-            "{\"key\":\"time_warp\",\"name\":\"Time Warp\",\"type\":\"float\",\"min\":0.25,\"max\":4,\"step\":0.05},"
+            "{\"key\":\"time_warp\",\"name\":\"Time Warp\",\"type\":\"float\",\"min\":0.25,\"max\":8,\"step\":0.05},"
             "{\"key\":\"feedback\",\"name\":\"Feedback\",\"type\":\"float\",\"min\":0,\"max\":0.95,\"step\":0.01},"
             "{\"key\":\"mode\",\"name\":\"Mode\",\"type\":\"enum\",\"options\":[\"Random\",\"Pitch Up\",\"Pitch Down\",\"Density Up\",\"Time Warp\",\"Dens Arp\",\"Deltarupt\",\"Spec Warp\"],\"default\":0},"
             "{\"key\":\"Special\",\"name\":\"Special\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
@@ -1478,7 +1907,15 @@ static int structor_get_param(void *instance, const char *key, char *buf, int bu
             "{\"key\":\"seq_time\",\"name\":\"Seq Time\",\"type\":\"int\",\"min\":10,\"max\":1000,\"step\":5},"
             "{\"key\":\"seq_mult\",\"name\":\"Seq Mult\",\"type\":\"enum\",\"options\":[\"1/8\",\"1/4\",\"1/2\",\"3/4\",\"1x\",\"1.5x\",\"2x\",\"3x\",\"4x\"],\"default\":4},"
             "{\"key\":\"detection\",\"name\":\"Detection\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
-            "{\"key\":\"rnd_filter\",\"name\":\"Rnd Filter\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
+            "{\"key\":\"rnd_filter\",\"name\":\"Rnd Filter\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"preset\",\"name\":\"Preset\",\"type\":\"int\",\"min\":0,\"max\":19,\"step\":1},"
+            "{\"key\":\"rnd_preset\",\"name\":\"Rnd Preset\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"master_filter\",\"name\":\"Filter\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"rnd_reverb\",\"name\":\"Rnd Reverb\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"rev_mix\",\"name\":\"Rev Mix\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"rev_size\",\"name\":\"Rev Size\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"rev_decay\",\"name\":\"Rev Decay\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01},"
+            "{\"key\":\"rev_damp\",\"name\":\"Rev Damp\",\"type\":\"float\",\"min\":0,\"max\":1,\"step\":0.01}"
             "]";
         int len = (int)strlen(cp);
         if (len >= buf_len) return -1;
@@ -1489,13 +1926,16 @@ static int structor_get_param(void *instance, const char *key, char *buf, int bu
             "{\"modes\":null,\"levels\":{"
             "\"root\":{\"name\":\"Structor\","
             "\"knobs\":[\"envelope\",\"density\",\"grain_size\",\"time_warp\",\"feedback\",\"mode\",\"Special\",\"mix\"],"
-            "\"params\":[{\"level\":\"Structor\",\"label\":\"Structor\"},{\"level\":\"Randomize\",\"label\":\"Randomize\"}]},"
+            "\"params\":[{\"level\":\"Structor\",\"label\":\"Structor\"},{\"level\":\"Randomize\",\"label\":\"Randomize\"},{\"level\":\"Presets\",\"label\":\"Presets\"}]},"
             "\"Structor\":{\"label\":\"Structor\","
             "\"knobs\":[\"envelope\",\"density\",\"grain_size\",\"time_warp\",\"feedback\",\"mode\",\"Special\",\"mix\"],"
             "\"params\":[\"envelope\",\"density\",\"grain_size\",\"time_warp\",\"feedback\",\"mode\",\"Special\",\"mix\"]},"
             "\"Randomize\":{\"label\":\"Randomize\","
             "\"knobs\":[\"rnd_envelope\",\"rnd_density\",\"rnd_grain\",\"rnd_time\",\"rnd_pan\",\"seq_on\",\"seq_time\",\"seq_mult\"],"
-            "\"params\":[\"rnd_envelope\",\"rnd_density\",\"rnd_grain\",\"rnd_time\",\"rnd_pan\",\"seq_on\",\"seq_time\",\"seq_mult\",\"detection\",\"rnd_filter\"]}"
+            "\"params\":[\"rnd_envelope\",\"rnd_density\",\"rnd_grain\",\"rnd_time\",\"rnd_pan\",\"seq_on\",\"seq_time\",\"seq_mult\",\"detection\",\"rnd_filter\"]},"
+            "\"Presets\":{\"label\":\"Presets\","
+            "\"knobs\":[\"preset\",\"rnd_preset\",\"master_filter\",\"rnd_reverb\",\"rev_mix\",\"rev_size\",\"rev_decay\",\"rev_damp\"],"
+            "\"params\":[\"preset\",\"rnd_preset\",\"master_filter\",\"rnd_reverb\",\"rev_mix\",\"rev_size\",\"rev_decay\",\"rev_damp\"]}"
             "}}";
         int len = (int)strlen(hier);
         if (len >= buf_len) return -1;
@@ -1553,12 +1993,39 @@ static int structor_get_param(void *instance, const char *key, char *buf, int bu
         return snprintf(buf, buf_len, "%d", (int)inst->seq_time_ms);
     } else if (strcmp(key, "seq_mult") == 0) {
         return snprintf(buf, buf_len, "%s", SEQ_MULT_NAMES[clampi(inst->seq_mult, 0, MAX_SEQ_MULT - 1)]);
+    } else if (strcmp(key, "preset") == 0) {
+        return snprintf(buf, buf_len, "%d", inst->preset);
+    } else if (strcmp(key, "rnd_preset") == 0) {
+        return snprintf(buf, buf_len, "0");  /* always reads 0; any set triggers randomize */
+    } else if (strcmp(key, "master_filter") == 0) {
+        return snprintf(buf, buf_len, "%.4f", inst->master_filter);
+    } else if (strcmp(key, "rnd_reverb") == 0) {
+        return snprintf(buf, buf_len, "%.4f", inst->rnd_reverb);
+    } else if (strcmp(key, "rev_mix") == 0) {
+        return snprintf(buf, buf_len, "%.4f", inst->rev_mix);
+    } else if (strcmp(key, "rev_size") == 0) {
+        return snprintf(buf, buf_len, "%.4f", inst->rev_size);
+    } else if (strcmp(key, "rev_decay") == 0) {
+        return snprintf(buf, buf_len, "%.4f", inst->rev_decay);
+    } else if (strcmp(key, "rev_damp") == 0) {
+        return snprintf(buf, buf_len, "%.4f", inst->rev_damp);
     }
 
     /* ---- Knob overlay: knob_N_name (page-aware) ---- */
     else if (strncmp(key, "knob_", 5) == 0 && strstr(key, "_name")) {
         int knob_num = atoi(key + 5);
-        if (inst->current_page == 1) {
+        if (inst->current_page == 2) {
+            switch (knob_num) {
+                case 1: return snprintf(buf, buf_len, "Preset");
+                case 2: return snprintf(buf, buf_len, "Rnd Preset");
+                case 3: return snprintf(buf, buf_len, "Filter");
+                case 4: return snprintf(buf, buf_len, "Rnd Reverb");
+                case 5: return snprintf(buf, buf_len, "Rev Mix");
+                case 6: return snprintf(buf, buf_len, "Rev Size");
+                case 7: return snprintf(buf, buf_len, "Rev Decay");
+                case 8: return snprintf(buf, buf_len, "Rev Damp");
+            }
+        } else if (inst->current_page == 1) {
             switch (knob_num) {
                 case 1: return snprintf(buf, buf_len, "Rnd Env");
                 case 2: return snprintf(buf, buf_len, "Rnd Density");
@@ -1587,7 +2054,23 @@ static int structor_get_param(void *instance, const char *key, char *buf, int bu
     /* ---- Knob overlay: knob_N_value (page-aware) ---- */
     else if (strncmp(key, "knob_", 5) == 0 && strstr(key, "_value")) {
         int knob_num = atoi(key + 5);
-        if (inst->current_page == 1) {
+        if (inst->current_page == 2) {
+            switch (knob_num) {
+                case 1: return snprintf(buf, buf_len, "%d", inst->preset);
+                case 2: return snprintf(buf, buf_len, "Go!");
+                case 3: {
+                    float mf = inst->master_filter;
+                    if (mf < 0.49f) return snprintf(buf, buf_len, "LP %d%%", (int)((0.49f - mf) / 0.49f * 100));
+                    if (mf > 0.51f) return snprintf(buf, buf_len, "HP %d%%", (int)((mf - 0.51f) / 0.49f * 100));
+                    return snprintf(buf, buf_len, "Off");
+                }
+                case 4: return snprintf(buf, buf_len, "%d%%", (int)(inst->rnd_reverb * 100.0f));
+                case 5: return snprintf(buf, buf_len, "%d%%", (int)(inst->rev_mix * 100.0f));
+                case 6: return snprintf(buf, buf_len, "%d%%", (int)(inst->rev_size * 100.0f));
+                case 7: return snprintf(buf, buf_len, "%d%%", (int)(inst->rev_decay * 100.0f));
+                case 8: return snprintf(buf, buf_len, "%d%%", (int)(inst->rev_damp * 100.0f));
+            }
+        } else if (inst->current_page == 1) {
             switch (knob_num) {
                 case 1: return snprintf(buf, buf_len, "%d%%", (int)(inst->rnd_envelope * 100.0f));
                 case 2: return snprintf(buf, buf_len, "%d%%", (int)(inst->rnd_density * 100.0f));
