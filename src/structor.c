@@ -467,31 +467,35 @@ static void reverb_process(StructorInstance *inst, int frames) {
 typedef struct {
     float envelope, density, grain_size, time_warp, mix, feedback;
     int mode;
+    /* Randomize page */
+    float rnd_envelope, rnd_density, rnd_grain, rnd_time, rnd_pan;
+    int rnd_filter;
+    /* Presets page */
     float master_filter, rnd_reverb, rev_mix, rev_size, rev_decay, rev_damp;
 } structor_preset_t;
 
-/*                       env   den   grain tw    mix   fb    mode mfilt rrv   rmix  rsz   rdcy  rdmp */
+/*                       env   den   grain tw    mix   fb    mode re    rd    rg    rt    rp   rf   mfilt rrv   rmix  rsz   rdcy  rdmp */
 static const structor_preset_t STRUCTOR_PRESETS[NUM_STRUCTOR_PRESETS] = {
-    {0.50f,5.00f,5.00f,1.00f,0.50f,0.20f, 0, 0.50f,0.00f,0.00f,0.50f,0.50f,0.50f}, /* 0 Init */
-    {0.40f,0.50f,0.60f,1.50f,0.60f,0.30f, 0, 0.50f,0.40f,0.30f,0.40f,0.60f,0.40f}, /* 1 Scatter */
-    {0.55f,0.80f,1.20f,0.50f,0.55f,0.15f, 1, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 2 Ascend */
-    {0.55f,0.80f,1.20f,0.60f,0.55f,0.15f, 2, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 3 Descend */
-    {0.30f,0.60f,0.40f,1.00f,0.65f,0.25f, 5, 0.50f,0.30f,0.20f,0.30f,0.40f,0.30f}, /* 4 Pulse */
-    {0.15f,0.90f,0.30f,1.50f,0.70f,0.40f, 6, 0.35f,0.00f,0.00f,0.20f,0.30f,0.60f}, /* 5 Tape Cut */
-    {0.60f,0.40f,2.00f,0.70f,0.50f,0.10f, 7, 0.50f,0.60f,0.50f,0.80f,0.80f,0.60f}, /* 6 Spectral */
-    {0.70f,0.30f,3.00f,0.40f,0.45f,0.35f, 0, 0.50f,0.50f,0.60f,0.90f,0.90f,0.70f}, /* 7 Ambient */
-    {0.25f,0.95f,0.50f,2.00f,0.75f,0.50f, 0, 0.50f,0.70f,0.40f,0.50f,0.50f,0.30f}, /* 8 Chaos */
-    {0.65f,0.35f,2.50f,0.50f,0.55f,0.20f, 7, 0.60f,0.80f,0.70f,1.00f,0.95f,0.85f}, /* 9 Dark Hall */
-    {0.80f,0.20f,8.00f,0.30f,0.40f,0.50f, 0, 0.50f,0.30f,0.40f,0.70f,0.80f,0.80f}, /* 10 Frozen */
-    {0.20f,1.50f,0.20f,3.00f,0.70f,0.10f, 4, 0.50f,0.10f,0.10f,0.20f,0.30f,0.20f}, /* 11 Glitch */
-    {0.90f,0.15f,10.0f,0.25f,0.35f,0.60f, 7, 0.50f,0.70f,0.50f,1.00f,0.85f,0.90f}, /* 12 Drone */
-    {0.35f,0.80f,0.50f,1.00f,0.60f,0.30f, 5, 0.50f,0.50f,0.35f,0.50f,0.60f,0.40f}, /* 13 Sequenced */
-    {0.10f,2.00f,0.15f,4.00f,0.80f,0.00f, 6, 0.50f,0.00f,0.00f,0.30f,0.40f,0.50f}, /* 14 Shatter */
-    {0.60f,0.40f,3.00f,0.50f,0.45f,0.40f, 1, 0.50f,0.40f,0.45f,0.80f,0.75f,0.65f}, /* 15 Rise */
-    {0.45f,0.60f,1.50f,1.20f,0.55f,0.20f, 3, 0.50f,0.60f,0.40f,0.60f,0.55f,0.45f}, /* 16 Thick */
-    {0.70f,0.25f,6.00f,0.35f,0.40f,0.70f, 0, 0.40f,0.20f,0.30f,0.40f,0.50f,0.70f}, /* 17 Lo-Fi */
-    {0.50f,0.50f,2.00f,1.50f,0.60f,0.15f, 2, 0.50f,0.80f,0.60f,0.90f,0.80f,0.50f}, /* 18 Cathedral */
-    {0.30f,1.00f,0.80f,2.00f,0.75f,0.35f, 4, 0.50f,0.40f,0.25f,0.35f,0.45f,0.35f}, /* 19 Warp */
+    {0.50f,5.00f,5.00f,1.00f,0.50f,0.20f, 0, 0.0f,0.0f,0.0f,0.0f,0.25f, 0, 0.50f,0.00f,0.00f,0.50f,0.50f,0.50f}, /* 0 Init */
+    {0.40f,0.50f,0.60f,1.50f,0.60f,0.30f, 0, 0.3f,0.4f,0.3f,0.2f,0.50f,30, 0.50f,0.40f,0.30f,0.40f,0.60f,0.40f}, /* 1 Scatter */
+    {0.55f,0.80f,1.20f,0.50f,0.55f,0.15f, 1, 0.2f,0.3f,0.2f,0.1f,0.30f, 0, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 2 Ascend */
+    {0.55f,0.80f,1.20f,0.60f,0.55f,0.15f, 2, 0.2f,0.3f,0.2f,0.1f,0.30f, 0, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 3 Descend */
+    {0.30f,0.60f,0.40f,1.00f,0.65f,0.25f, 5, 0.4f,0.5f,0.3f,0.5f,0.40f,20, 0.50f,0.30f,0.20f,0.30f,0.40f,0.30f}, /* 4 Pulse */
+    {0.15f,0.90f,0.30f,1.50f,0.70f,0.40f, 6, 0.5f,0.6f,0.4f,0.3f,0.20f,50, 0.35f,0.00f,0.00f,0.20f,0.30f,0.60f}, /* 5 Tape Cut */
+    {0.60f,0.40f,2.00f,0.70f,0.50f,0.10f, 7, 0.3f,0.2f,0.3f,0.2f,0.50f,40, 0.50f,0.60f,0.50f,0.80f,0.80f,0.60f}, /* 6 Spectral */
+    {0.70f,0.30f,3.00f,0.40f,0.45f,0.35f, 0, 0.6f,0.4f,0.5f,0.4f,0.60f, 0, 0.50f,0.50f,0.60f,0.90f,0.90f,0.70f}, /* 7 Ambient */
+    {0.25f,0.95f,0.50f,2.00f,0.75f,0.50f, 0, 0.8f,0.7f,0.8f,0.7f,0.80f,60, 0.50f,0.70f,0.40f,0.50f,0.50f,0.30f}, /* 8 Chaos */
+    {0.65f,0.35f,2.50f,0.50f,0.55f,0.20f, 7, 0.4f,0.3f,0.4f,0.3f,0.40f, 0, 0.60f,0.80f,0.70f,1.00f,0.95f,0.85f}, /* 9 Dark Hall */
+    {0.80f,0.20f,8.00f,0.30f,0.40f,0.50f, 0, 0.5f,0.3f,0.5f,0.3f,0.30f, 0, 0.50f,0.30f,0.40f,0.70f,0.80f,0.80f}, /* 10 Frozen */
+    {0.20f,1.50f,0.20f,3.00f,0.70f,0.10f, 4, 0.7f,0.8f,0.6f,0.8f,0.60f,70, 0.50f,0.10f,0.10f,0.20f,0.30f,0.20f}, /* 11 Glitch */
+    {0.90f,0.15f,10.0f,0.25f,0.35f,0.60f, 7, 0.3f,0.2f,0.3f,0.2f,0.20f, 0, 0.50f,0.70f,0.50f,1.00f,0.85f,0.90f}, /* 12 Drone */
+    {0.35f,0.80f,0.50f,1.00f,0.60f,0.30f, 5, 0.5f,0.6f,0.4f,0.6f,0.50f,30, 0.50f,0.50f,0.35f,0.50f,0.60f,0.40f}, /* 13 Sequenced */
+    {0.10f,2.00f,0.15f,4.00f,0.80f,0.00f, 6, 0.6f,0.7f,0.5f,0.4f,0.30f,80, 0.50f,0.00f,0.00f,0.30f,0.40f,0.50f}, /* 14 Shatter */
+    {0.60f,0.40f,3.00f,0.50f,0.45f,0.40f, 1, 0.3f,0.3f,0.4f,0.2f,0.40f,20, 0.50f,0.40f,0.45f,0.80f,0.75f,0.65f}, /* 15 Rise */
+    {0.45f,0.60f,1.50f,1.20f,0.55f,0.20f, 3, 0.4f,0.5f,0.3f,0.3f,0.50f,40, 0.50f,0.60f,0.40f,0.60f,0.55f,0.45f}, /* 16 Thick */
+    {0.70f,0.25f,6.00f,0.35f,0.40f,0.70f, 0, 0.5f,0.4f,0.6f,0.3f,0.40f, 0, 0.40f,0.20f,0.30f,0.40f,0.50f,0.70f}, /* 17 Lo-Fi */
+    {0.50f,0.50f,2.00f,1.50f,0.60f,0.15f, 2, 0.3f,0.4f,0.3f,0.4f,0.50f, 0, 0.50f,0.80f,0.60f,0.90f,0.80f,0.50f}, /* 18 Cathedral */
+    {0.30f,1.00f,0.80f,2.00f,0.75f,0.35f, 4, 0.6f,0.5f,0.5f,0.5f,0.60f,50, 0.50f,0.40f,0.25f,0.35f,0.45f,0.35f}, /* 19 Warp */
 };
 static const char *STRUCTOR_PRESET_NAMES[NUM_STRUCTOR_PRESETS] = {
     "Init","Scatter","Ascend","Descend","Pulse",
@@ -508,6 +512,11 @@ static void apply_structor_preset(void *instance, int idx) {
     inst->grain_size = p->grain_size; inst->time_warp = p->time_warp;
     inst->mix = p->mix; inst->feedback = p->feedback;
     inst->mode = p->mode;
+    /* Randomize page */
+    inst->rnd_envelope = p->rnd_envelope; inst->rnd_density = p->rnd_density;
+    inst->rnd_grain = p->rnd_grain; inst->rnd_time = p->rnd_time;
+    inst->rnd_pan = p->rnd_pan; inst->rnd_filter = p->rnd_filter;
+    /* Presets page */
     inst->master_filter = p->master_filter;
     inst->rnd_reverb = p->rnd_reverb; inst->rev_mix = p->rev_mix;
     inst->rev_size = p->rev_size; inst->rev_decay = p->rev_decay;
@@ -516,6 +525,7 @@ static void apply_structor_preset(void *instance, int idx) {
 }
 
 static void randomize_preset(StructorInstance *inst) {
+    /* Structor page */
     inst->envelope = 0.1f + rand_unipolar(&inst->rng) * 0.8f;
     inst->density = 0.2f + rand_unipolar(&inst->rng) * 0.8f;
     inst->grain_size = 0.3f + rand_unipolar(&inst->rng) * 4.0f;
@@ -523,7 +533,15 @@ static void randomize_preset(StructorInstance *inst) {
     inst->mix = 0.3f + rand_unipolar(&inst->rng) * 0.5f;
     inst->feedback = rand_unipolar(&inst->rng) * 0.6f;
     inst->mode = (int)(rand_unipolar(&inst->rng) * MAX_MODES) % MAX_MODES;
-    inst->master_filter = 0.5f; /* always reset to bypass — avoids gain/distortion bugs */
+    /* Randomize page — this is where the magic happens */
+    inst->rnd_envelope = rand_unipolar(&inst->rng) * 0.7f;
+    inst->rnd_density = rand_unipolar(&inst->rng) * 0.6f;
+    inst->rnd_grain = rand_unipolar(&inst->rng) * 0.7f;
+    inst->rnd_time = rand_unipolar(&inst->rng) * 0.6f;
+    inst->rnd_pan = rand_unipolar(&inst->rng) * 0.8f;
+    inst->rnd_filter = (int)(rand_unipolar(&inst->rng) * 60.0f);
+    /* Presets page */
+    inst->master_filter = 0.5f; /* always bypass — avoids gain/distortion bugs */
     inst->rnd_reverb = rand_unipolar(&inst->rng) * 0.8f;
     inst->rev_mix = rand_unipolar(&inst->rng) * 0.7f;
     inst->rev_size = rand_unipolar(&inst->rng);

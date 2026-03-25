@@ -109,6 +109,11 @@ Menu: Detection (onset sensitivity), Rnd Filter (per-grain LP/HP chance)
 - Reverb stability: max feedback reduced from 0.97 to 0.88, hard clip inside feedback loop, input attenuation
 - Filter excluded from Rnd Preset to prevent gain/distortion artifacts
 
+### v0.2.1
+- **Presets now affect Randomize page** — all 20 presets include Rnd Envelope, Rnd Density, Rnd Grain, Rnd Time, Rnd Pan, and Rnd Filter values
+- **Rnd Preset randomizes everything** — Structor page + Randomize page + Presets page params (except Filter, kept at bypass)
+- Each preset has unique Randomize page character (e.g. Chaos=high randomization, Ambient=moderate, Init=all zero)
+
 ## Build
 
 ```bash
