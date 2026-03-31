@@ -2,7 +2,7 @@
     "id": "structor",
     "name": "Structor",
     "abbrev": "STRCT",
-    "version": "0.2.1",
+    "version": "0.1.3",
     "description": "Musique concrète sound deconstructor/reconstructor",
     "author": "fillioning",
     "dsp": "structor.so",
@@ -21,8 +21,7 @@
                     "knobs": ["envelope", "density", "grain_size", "time_warp", "feedback", "mode", "Special", "mix"],
                     "params": [
                         {"level": "Structor", "label": "Structor"},
-                        {"level": "Randomize", "label": "Randomize"},
-                        {"level": "Presets", "label": "Presets"}
+                        {"level": "Randomize", "label": "Randomize"}
                     ]
                 },
                 "Structor": {
@@ -34,13 +33,36 @@
                     "label": "Randomize",
                     "knobs": ["rnd_envelope", "rnd_density", "rnd_grain", "rnd_time", "rnd_pan", "seq_on", "seq_time", "seq_mult"],
                     "params": ["rnd_envelope", "rnd_density", "rnd_grain", "rnd_time", "rnd_pan", "seq_on", "seq_time", "seq_mult", "detection", "rnd_filter"]
-                },
-                "Presets": {
-                    "label": "Presets",
-                    "knobs": ["preset", "rnd_preset", "master_filter", "rnd_reverb", "rev_mix", "rev_size", "rev_decay", "rev_damp"],
-                    "params": ["preset", "rnd_preset", "master_filter", "rnd_reverb", "rev_mix", "rev_size", "rev_decay", "rev_damp"]
                 }
             }
-        }
+        },
+        "chain_params": [
+            {"key": "envelope",       "name": "Envelope",    "type": "float", "min": 0,    "max": 1,    "step": 0.02},
+            {"key": "density",        "name": "Density",     "type": "float", "min": 0.05, "max": 20,   "step": 0.05},
+            {"key": "grain_size",     "name": "Grain Size",  "type": "float", "min": 0.1,  "max": 40,   "step": 0.2},
+            {"key": "time_warp",      "name": "Time Warp",   "type": "float", "min": 0.25, "max": 8,    "step": 0.05},
+            {"key": "feedback",       "name": "Feedback",    "type": "float", "min": 0,    "max": 0.95, "step": 0.01},
+            {"key": "mode",           "name": "Mode",        "type": "enum",  "options": ["Random","Pitch Up","Pitch Down","Density Up","Time Warp","Dens Arp","Deltarupt","Spec Warp"]},
+            {"key": "Special",        "name": "Special",     "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "mix",            "name": "Mix",         "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rnd_envelope",   "name": "Rnd Env",     "type": "float", "min": 0,    "max": 1,    "step": 0.02},
+            {"key": "rnd_density",    "name": "Rnd Density", "type": "float", "min": 0,    "max": 1,    "step": 0.02},
+            {"key": "rnd_grain",      "name": "Rnd Grain",   "type": "float", "min": 0,    "max": 1,    "step": 0.02},
+            {"key": "rnd_time",       "name": "Rnd Time",    "type": "float", "min": 0,    "max": 1,    "step": 0.02},
+            {"key": "rnd_pan",        "name": "Rnd Pan",     "type": "float", "min": 0,    "max": 1,    "step": 0.02},
+            {"key": "seq_on",         "name": "Sequence",    "type": "enum",  "options": ["Off","On"]},
+            {"key": "seq_time",       "name": "Seq Time",    "type": "int",   "min": 10,   "max": 1000, "step": 5},
+            {"key": "seq_mult",       "name": "Seq Mult",    "type": "enum",  "options": ["1/8","1/4","1/2","3/4","1x","1.5x","2x","3x","4x"]},
+            {"key": "detection",      "name": "Detection",   "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rnd_filter",     "name": "Rnd Filter",  "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "preset",         "name": "Preset",      "type": "int",   "min": 0,    "max": 19,   "step": 1},
+            {"key": "rnd_preset",     "name": "Rnd Preset",  "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "master_filter",  "name": "Filter",      "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rnd_reverb",     "name": "Rnd Reverb",  "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rev_mix",        "name": "Rev Mix",     "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rev_size",       "name": "Rev Size",    "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rev_decay",      "name": "Rev Decay",   "type": "float", "min": 0,    "max": 1,    "step": 0.01},
+            {"key": "rev_damp",       "name": "Rev Damp",    "type": "float", "min": 0,    "max": 1,    "step": 0.01}
+        ]
     }
 }
