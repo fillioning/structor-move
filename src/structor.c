@@ -71,7 +71,7 @@ typedef struct audio_fx_api_v2 {
 #define BLOCK_SIZE      128
 #define DETECT_WINDOW   8192    /* ~186 ms detection window */
 #define RESCAN_BLOCKS   128     /* re-detect every ~0.37 sec (128 * 128 = 16384 samples) */
-#define RECON_GAIN      3.75f   /* makeup gain for reconstruction (compensates Hann window avg + tanhf compression) */
+#define RECON_GAIN_BASE 1.8f    /* makeup gain after COLA normalization (window sum always 1.0) */
 
 /* Schroeder reverb delay line max lengths (prime-based) */
 #define REV_COMB_MAX_0  2048
@@ -132,6 +132,23 @@ typedef struct {
 } biquad_t;
 
 /* ========================================================================
+   Grain Stream — one playback head in the dual-stream OLA system
+   ======================================================================== */
+
+#define NUM_GRAIN_STREAMS 2
+
+typedef struct {
+    float playback_position;
+    uint32_t playback_index;
+    uint32_t locked_grain_size;
+    float current_grain_pan;
+    int grain_reverb_send;
+    float grain_filter_cutoff;
+    biquad_t grain_filt_l[3];
+    biquad_t grain_filt_r[3];
+} GrainStream;
+
+/* ========================================================================
    Instance
    ======================================================================== */
 
@@ -146,17 +163,13 @@ typedef struct {
     uint32_t event_count;
     int playback_order[MAX_EVENTS];
 
-    /* Grain playback state — 2-slot overlap for click-free transitions */
-    uint32_t playback_index;
-    float playback_position;
-    uint32_t locked_grain_size;   /* grain size locked at grain start, prevents mid-grain jumps */
-    /* Crossfade grain (slot B): fading-out previous grain */
-    int xf_active;               /* 1 if crossfade grain is rendering */
-    float xf_position;           /* playback position in crossfade grain */
-    uint32_t xf_grain_start;     /* sample index of crossfade grain's event */
-    uint32_t xf_grain_size;      /* locked grain size of crossfade grain */
-    float xf_speed;              /* playback speed of crossfade grain */
-    float xf_pan;                /* pan of crossfade grain */
+    /* Dual-stream OLA: 2 grain streams with 50% overlap for click-free output.
+     * Stream 1 is offset by half a grain from stream 0. Both render simultaneously
+     * and sum into the output. With Hann windows + 50% overlap:
+     * sin²(πx) + sin²(π(x+0.5)) = sin²(πx) + cos²(πx) = 1.0 (constant power).
+     * Deltarupt mode uses only stream[0] to preserve hard-cut character. */
+    GrainStream stream[NUM_GRAIN_STREAMS];
+    uint32_t next_grain_index;   /* shared counter: next event to assign to a stream */
 
     /* Reconstruction output buffers (pre-allocated, no malloc in render) */
     float recon_l[BLOCK_SIZE];
@@ -211,16 +224,9 @@ typedef struct {
     float seq_time_offset;         /* quantized octave index: -2,-1,0,1,2 → 0.25,0.5,1,2,4 */
     float seq_pan_offset;
     float seq_filter_offset;
-    float current_grain_pan;       /* per-grain random pan: -1 (full L) to +1 (full R) */
     int   rnd_filter;              /* 0=off, 1-100 = % chance of random cutoff change per grain */
-    float grain_filter_cutoff;     /* current grain filter cutoff: 0-100 (0-49=LPF, 50=bypass, 51-100=HPF) */
 
-    /* Per-grain Isolator3 filter (3-stage cascade, stereo) */
-    biquad_t grain_filt_l[3];
-    biquad_t grain_filt_r[3];
-
-    /* Per-grain reverb send flag (set at grain transition) */
-    int grain_reverb_send;
+    /* Per-grain state (pan, filter, reverb) now lives in GrainStream */
 
     /* DC-blocking filter state (removes low-freq thuds from buffer position jumps) */
     float dc_l_prev_in, dc_l_prev_out;
@@ -467,6 +473,7 @@ static void reverb_process(StructorInstance *inst, int frames) {
 typedef struct {
     float envelope, density, grain_size, time_warp, mix, feedback;
     int mode;
+    float special;  /* mode-specific Knob 7 ("Special") value — see apply_structor_preset */
     /* Randomize page */
     float rnd_envelope, rnd_density, rnd_grain, rnd_time, rnd_pan;
     int rnd_filter;
@@ -474,28 +481,30 @@ typedef struct {
     float master_filter, rnd_reverb, rev_mix, rev_size, rev_decay, rev_damp;
 } structor_preset_t;
 
-/*                       env   den   grain tw    mix   fb    mode re    rd    rg    rt    rp   rf   mfilt rrv   rmix  rsz   rdcy  rdmp */
+/*                       env   den   grain tw    mix   fb   mode  spcl  re    rd    rg    rt    rp   rf   mfilt rrv   rmix  rsz   rdcy  rdmp */
+/* Special values per mode: 0=shuffle_bias, 1=pitch_range, 2=octave_fold(int), 3=density_curve,
+ *                          4=speed_curve_exp, 5=arp_pattern(int), 6=deltarupt_attack, 7=density_morphing */
 static const structor_preset_t STRUCTOR_PRESETS[NUM_STRUCTOR_PRESETS] = {
-    {0.50f,5.00f,5.00f,1.00f,0.50f,0.20f, 0, 0.0f,0.0f,0.0f,0.0f,0.25f, 0, 0.50f,0.00f,0.00f,0.50f,0.50f,0.50f}, /* 0 Init */
-    {0.40f,0.50f,0.60f,1.50f,0.60f,0.30f, 0, 0.3f,0.4f,0.3f,0.2f,0.50f,30, 0.50f,0.40f,0.30f,0.40f,0.60f,0.40f}, /* 1 Scatter */
-    {0.55f,0.80f,1.20f,0.50f,0.55f,0.15f, 1, 0.2f,0.3f,0.2f,0.1f,0.30f, 0, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 2 Ascend */
-    {0.55f,0.80f,1.20f,0.60f,0.55f,0.15f, 2, 0.2f,0.3f,0.2f,0.1f,0.30f, 0, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 3 Descend */
-    {0.30f,0.60f,0.40f,1.00f,0.65f,0.25f, 5, 0.4f,0.5f,0.3f,0.5f,0.40f,20, 0.50f,0.30f,0.20f,0.30f,0.40f,0.30f}, /* 4 Pulse */
-    {0.15f,0.90f,0.30f,1.50f,0.70f,0.40f, 6, 0.5f,0.6f,0.4f,0.3f,0.20f,50, 0.35f,0.00f,0.00f,0.20f,0.30f,0.60f}, /* 5 Tape Cut */
-    {0.60f,0.40f,2.00f,0.70f,0.50f,0.10f, 7, 0.3f,0.2f,0.3f,0.2f,0.50f,40, 0.50f,0.60f,0.50f,0.80f,0.80f,0.60f}, /* 6 Spectral */
-    {0.70f,0.30f,3.00f,0.40f,0.45f,0.35f, 0, 0.6f,0.4f,0.5f,0.4f,0.60f, 0, 0.50f,0.50f,0.60f,0.90f,0.90f,0.70f}, /* 7 Ambient */
-    {0.25f,0.95f,0.50f,2.00f,0.75f,0.50f, 0, 0.8f,0.7f,0.8f,0.7f,0.80f,60, 0.50f,0.70f,0.40f,0.50f,0.50f,0.30f}, /* 8 Chaos */
-    {0.65f,0.35f,2.50f,0.50f,0.55f,0.20f, 7, 0.4f,0.3f,0.4f,0.3f,0.40f, 0, 0.60f,0.80f,0.70f,1.00f,0.95f,0.85f}, /* 9 Dark Hall */
-    {0.80f,0.20f,8.00f,0.30f,0.40f,0.50f, 0, 0.5f,0.3f,0.5f,0.3f,0.30f, 0, 0.50f,0.30f,0.40f,0.70f,0.80f,0.80f}, /* 10 Frozen */
-    {0.20f,1.50f,0.20f,3.00f,0.70f,0.10f, 4, 0.7f,0.8f,0.6f,0.8f,0.60f,70, 0.50f,0.10f,0.10f,0.20f,0.30f,0.20f}, /* 11 Glitch */
-    {0.90f,0.15f,10.0f,0.25f,0.35f,0.60f, 7, 0.3f,0.2f,0.3f,0.2f,0.20f, 0, 0.50f,0.70f,0.50f,1.00f,0.85f,0.90f}, /* 12 Drone */
-    {0.35f,0.80f,0.50f,1.00f,0.60f,0.30f, 5, 0.5f,0.6f,0.4f,0.6f,0.50f,30, 0.50f,0.50f,0.35f,0.50f,0.60f,0.40f}, /* 13 Sequenced */
-    {0.10f,2.00f,0.15f,4.00f,0.80f,0.00f, 6, 0.6f,0.7f,0.5f,0.4f,0.30f,80, 0.50f,0.00f,0.00f,0.30f,0.40f,0.50f}, /* 14 Shatter */
-    {0.60f,0.40f,3.00f,0.50f,0.45f,0.40f, 1, 0.3f,0.3f,0.4f,0.2f,0.40f,20, 0.50f,0.40f,0.45f,0.80f,0.75f,0.65f}, /* 15 Rise */
-    {0.45f,0.60f,1.50f,1.20f,0.55f,0.20f, 3, 0.4f,0.5f,0.3f,0.3f,0.50f,40, 0.50f,0.60f,0.40f,0.60f,0.55f,0.45f}, /* 16 Thick */
-    {0.70f,0.25f,6.00f,0.35f,0.40f,0.70f, 0, 0.5f,0.4f,0.6f,0.3f,0.40f, 0, 0.40f,0.20f,0.30f,0.40f,0.50f,0.70f}, /* 17 Lo-Fi */
-    {0.50f,0.50f,2.00f,1.50f,0.60f,0.15f, 2, 0.3f,0.4f,0.3f,0.4f,0.50f, 0, 0.50f,0.80f,0.60f,0.90f,0.80f,0.50f}, /* 18 Cathedral */
-    {0.30f,1.00f,0.80f,2.00f,0.75f,0.35f, 4, 0.6f,0.5f,0.5f,0.5f,0.60f,50, 0.50f,0.40f,0.25f,0.35f,0.45f,0.35f}, /* 19 Warp */
+    {0.50f,5.00f,5.00f,1.00f,0.50f,0.20f, 0, 0.50f, 0.0f,0.0f,0.0f,0.0f,0.25f, 0, 0.50f,0.00f,0.00f,0.50f,0.50f,0.50f}, /* 0 Init: Random, bias 50% */
+    {0.40f,1.50f,2.00f,1.50f,0.60f,0.30f, 0, 0.70f, 0.3f,0.4f,0.3f,0.0f,0.50f,30, 0.50f,0.40f,0.30f,0.40f,0.60f,0.40f}, /* 1 Scatter: Random, bias 70% */
+    {0.55f,1.50f,2.00f,0.50f,0.55f,0.15f, 1, 0.30f, 0.2f,0.3f,0.2f,0.0f,0.30f, 0, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 2 Ascend: Pitch Up, win 30% */
+    {0.55f,1.50f,2.00f,0.60f,0.55f,0.15f, 2, 2.00f, 0.2f,0.3f,0.2f,0.0f,0.30f, 0, 0.50f,0.20f,0.25f,0.60f,0.70f,0.50f}, /* 3 Descend: Pitch Down, Mirror */
+    {0.30f,1.50f,2.00f,1.00f,0.65f,0.25f, 5, 0.00f, 0.4f,0.5f,0.3f,0.0f,0.40f,20, 0.50f,0.30f,0.20f,0.30f,0.40f,0.30f}, /* 4 Pulse: Dens Arp, Up */
+    {0.15f,1.50f,2.00f,1.50f,0.70f,0.40f, 6, 0.05f, 0.5f,0.6f,0.4f,0.0f,0.20f,50, 0.35f,0.00f,0.00f,0.20f,0.30f,0.60f}, /* 5 Tape Cut: Deltarupt, attack 5% */
+    {0.60f,1.50f,2.00f,0.70f,0.50f,0.10f, 7, 0.40f, 0.3f,0.2f,0.3f,0.0f,0.50f,40, 0.50f,0.60f,0.50f,0.80f,0.80f,0.60f}, /* 6 Spectral: Spec Warp, morph 40% */
+    {0.70f,1.50f,3.00f,0.40f,0.45f,0.35f, 0, 0.30f, 0.6f,0.4f,0.5f,0.0f,0.60f, 0, 0.50f,0.50f,0.60f,0.90f,0.90f,0.70f}, /* 7 Ambient: Random, bias 30% */
+    {0.25f,1.50f,2.00f,2.00f,0.75f,0.50f, 0, 0.90f, 0.8f,0.7f,0.8f,0.0f,0.80f,60, 0.50f,0.70f,0.40f,0.50f,0.50f,0.30f}, /* 8 Chaos: Random, bias 90% */
+    {0.65f,1.50f,2.50f,0.50f,0.55f,0.20f, 7, 0.60f, 0.4f,0.3f,0.4f,0.0f,0.40f, 0, 0.60f,0.80f,0.70f,1.00f,0.95f,0.85f}, /* 9 Dark Hall: Spec Warp, morph 60% */
+    {0.80f,1.50f,8.00f,0.30f,0.40f,0.50f, 0, 0.20f, 0.5f,0.3f,0.5f,0.0f,0.30f, 0, 0.50f,0.30f,0.40f,0.70f,0.80f,0.80f}, /* 10 Frozen: Random, bias 20% */
+    {0.20f,1.50f,2.00f,3.00f,0.70f,0.10f, 4, 1.50f, 0.7f,0.8f,0.6f,0.0f,0.60f,70, 0.50f,0.10f,0.10f,0.20f,0.30f,0.20f}, /* 11 Glitch: Time Warp, curve 1.5x */
+    {0.90f,1.50f,10.0f,0.25f,0.35f,0.60f, 7, 0.80f, 0.3f,0.2f,0.3f,0.0f,0.20f, 0, 0.50f,0.70f,0.50f,1.00f,0.85f,0.90f}, /* 12 Drone: Spec Warp, morph 80% */
+    {0.35f,1.50f,2.00f,1.00f,0.60f,0.30f, 5, 2.00f, 0.5f,0.6f,0.4f,0.0f,0.50f,30, 0.50f,0.50f,0.35f,0.50f,0.60f,0.40f}, /* 13 Sequenced: Dens Arp, Up-Down */
+    {0.10f,2.00f,2.00f,4.00f,0.80f,0.00f, 6, 0.02f, 0.6f,0.7f,0.5f,0.0f,0.30f,80, 0.50f,0.00f,0.00f,0.30f,0.40f,0.50f}, /* 14 Shatter: Deltarupt, attack 2% */
+    {0.60f,1.50f,3.00f,0.50f,0.45f,0.40f, 1, 0.60f, 0.3f,0.3f,0.4f,0.0f,0.40f,20, 0.50f,0.40f,0.45f,0.80f,0.75f,0.65f}, /* 15 Rise: Pitch Up, win 60% */
+    {0.45f,1.50f,2.00f,1.20f,0.55f,0.20f, 3, 0.50f, 0.4f,0.5f,0.3f,0.0f,0.50f,40, 0.50f,0.60f,0.40f,0.60f,0.55f,0.45f}, /* 16 Thick: Density Up, curve 50% */
+    {0.70f,1.50f,6.00f,0.35f,0.40f,0.70f, 0, 0.40f, 0.5f,0.4f,0.6f,0.0f,0.40f, 0, 0.40f,0.20f,0.30f,0.40f,0.50f,0.70f}, /* 17 Lo-Fi: Random, bias 40% */
+    {0.50f,1.50f,2.00f,1.50f,0.60f,0.15f, 2, 1.00f, 0.3f,0.4f,0.3f,0.0f,0.50f, 0, 0.50f,0.80f,0.60f,0.90f,0.80f,0.50f}, /* 18 Cathedral: Pitch Down, 1 Oct */
+    {0.30f,1.50f,2.00f,2.00f,0.75f,0.35f, 4, 1.80f, 0.6f,0.5f,0.5f,0.0f,0.60f,50, 0.50f,0.40f,0.25f,0.35f,0.45f,0.35f}, /* 19 Warp: Time Warp, curve 1.8x */
 };
 static const char *STRUCTOR_PRESET_NAMES[NUM_STRUCTOR_PRESETS] = {
     "Init","Scatter","Ascend","Descend","Pulse",
@@ -512,6 +521,17 @@ static void apply_structor_preset(void *instance, int idx) {
     inst->grain_size = p->grain_size; inst->time_warp = p->time_warp;
     inst->mix = p->mix; inst->feedback = p->feedback;
     inst->mode = p->mode;
+    /* Mode-specific "Special" param (Knob 7) */
+    switch (p->mode) {
+        case MODE_RANDOM:           inst->shuffle_bias = p->special; break;
+        case MODE_PITCH_UP:         inst->pitch_range_window = p->special; break;
+        case MODE_PITCH_DOWN:       inst->octave_fold = (int)(p->special + 0.5f); break;
+        case MODE_DENSITY_UP:       inst->density_curve = p->special; break;
+        case MODE_TIME_WARP:        inst->speed_curve_exp = p->special; break;
+        case MODE_DENSITY_ARP:      inst->arp_pattern = (int)(p->special + 0.5f); break;
+        case MODE_DELTARUPT:        inst->deltarupt_attack = p->special; break;
+        case MODE_SPECTRAL_DENSITY: inst->density_morphing = p->special; break;
+    }
     /* Randomize page */
     inst->rnd_envelope = p->rnd_envelope; inst->rnd_density = p->rnd_density;
     inst->rnd_grain = p->rnd_grain; inst->rnd_time = p->rnd_time;
@@ -527,17 +547,26 @@ static void apply_structor_preset(void *instance, int idx) {
 static void randomize_preset(StructorInstance *inst) {
     /* Structor page */
     inst->envelope = 0.1f + rand_unipolar(&inst->rng) * 0.8f;
-    inst->density = 0.2f + rand_unipolar(&inst->rng) * 0.8f;
-    inst->grain_size = 0.3f + rand_unipolar(&inst->rng) * 4.0f;
+    inst->density = 1.5f + rand_unipolar(&inst->rng) * 3.5f;       /* 1.5–5.0 */
+    inst->grain_size = 2.0f + rand_unipolar(&inst->rng) * 3.0f;   /* 2.0–5.0 */
     inst->time_warp = 0.25f + rand_unipolar(&inst->rng) * 3.75f;
     inst->mix = 0.3f + rand_unipolar(&inst->rng) * 0.5f;
     inst->feedback = rand_unipolar(&inst->rng) * 0.6f;
     inst->mode = (int)(rand_unipolar(&inst->rng) * MAX_MODES) % MAX_MODES;
+    /* Mode-specific "Special" param */
+    inst->shuffle_bias = rand_unipolar(&inst->rng);
+    inst->pitch_range_window = rand_unipolar(&inst->rng);
+    inst->octave_fold = (int)(rand_unipolar(&inst->rng) * MAX_OCTAVE_FOLD) % MAX_OCTAVE_FOLD;
+    inst->density_curve = rand_unipolar(&inst->rng);
+    inst->speed_curve_exp = 0.5f + rand_unipolar(&inst->rng) * 1.5f;
+    inst->arp_pattern = (int)(rand_unipolar(&inst->rng) * MAX_ARP) % MAX_ARP;
+    inst->deltarupt_attack = rand_unipolar(&inst->rng) * 0.3f;
+    inst->density_morphing = rand_unipolar(&inst->rng);
     /* Randomize page — this is where the magic happens */
     inst->rnd_envelope = rand_unipolar(&inst->rng) * 0.7f;
     inst->rnd_density = rand_unipolar(&inst->rng) * 0.6f;
     inst->rnd_grain = rand_unipolar(&inst->rng) * 0.7f;
-    inst->rnd_time = rand_unipolar(&inst->rng) * 0.6f;
+    /* rnd_time intentionally NOT randomized — octave jumps change pitch too drastically */
     inst->rnd_pan = rand_unipolar(&inst->rng) * 0.8f;
     inst->rnd_filter = (int)(rand_unipolar(&inst->rng) * 60.0f);
     /* Presets page */
@@ -1046,15 +1075,13 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
     /* Apply random offsets to grain parameters.
        Asymmetric clamping prevents glitchy artifacts:
        - Grain: max -30% down (prevents near-zero grains)
-       - Envelope: clamp min 0.1 (prevents hard rectangle = clicks)
+       - Envelope: clamp min 0.15 (prevents hard rectangle = clicks)
        - Density/Time: max -50% down */
     float grain_offset = inst->seq_grain_offset;
     if (grain_offset < -0.3f) grain_offset = -0.3f;
     float eff_grain = inst->grain_size * (1.0f + grain_offset);
 
-    /* Smooth the envelope offset to prevent clicks from abrupt window shape changes.
-       ~50ms slew (coeff 0.002 at 44.1kHz/128 = ~344 blocks/sec → tau ≈ 1.4s at block rate,
-       but applied per-sample inside the block so tau ≈ 50ms) */
+    /* Smooth the envelope offset to prevent clicks from abrupt window shape changes. */
     float env_target = inst->seq_env_offset;
     inst->seq_env_smooth += 0.05f * (env_target - inst->seq_env_smooth);
     float env_offset = inst->seq_env_smooth;
@@ -1063,7 +1090,7 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
 
     /* Rnd Time: seq_time_offset is now an absolute octave multiplier (0.25, 0.5, 1, 2, 4) */
     float time_octave = inst->seq_time_offset;
-    if (time_octave < 0.1f) time_octave = 1.0f;  /* safety: default to 1x if unset */
+    if (time_octave < 0.1f) time_octave = 1.0f;
     float eff_time_warp = inst->time_warp * time_octave;
     if (eff_grain < 0.1f) eff_grain = 0.1f;
     if (eff_time_warp < 0.1f) eff_time_warp = 0.1f;
@@ -1074,192 +1101,178 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
     if (new_grain_size < 4) new_grain_size = 4;
     if (new_grain_size > 65536) new_grain_size = 65536;
 
-    /* Lock grain_size at grain start — changing mid-grain causes window phase jumps = clicks */
-    if (inst->locked_grain_size == 0 || inst->playback_position < 1.0f)
-        inst->locked_grain_size = new_grain_size;
-    uint32_t grain_size = inst->locked_grain_size;
+    /* Lock grain_size at grain start for each stream */
+    for (int si = 0; si < NUM_GRAIN_STREAMS; si++) {
+        GrainStream *gs = &inst->stream[si];
+        if (gs->locked_grain_size == 0 || gs->playback_position < 1.0f)
+            gs->locked_grain_size = new_grain_size;
+    }
 
-    /* Crossfade length: 128 samples (~3ms) or grain_size/3, whichever is smaller.
-     * Longer crossfade masks transient attacks from drums/clicky sources. */
-    uint32_t xf_len = (grain_size < 384) ? grain_size / 3 : 128;
-    if (xf_len < 8) xf_len = 8;
+    /* Initialize stream 1 phase offset: start at 50% of grain for OLA overlap.
+     * Only on first grain after detection reset (locked_grain_size was just set from 0). */
+    if (inst->stream[1].playback_position < 1.0f &&
+        inst->stream[1].locked_grain_size > 0 &&
+        inst->stream[0].playback_position < 1.0f) {
+        inst->stream[1].playback_position = (float)(inst->stream[1].locked_grain_size / 2);
+    }
+
+    /* Deltarupt mode: single-stream (hard cuts are its signature sound) */
+    int is_deltarupt = (inst->mode == MODE_DELTARUPT);
+    int num_streams = is_deltarupt ? 1 : NUM_GRAIN_STREAMS;
 
     for (uint32_t out_i = 0; out_i < num_samples; out_i++) {
 
-        /* ---- Render crossfade grain (slot B) if active ---- */
-        if (inst->xf_active) {
-            uint32_t xf_src = (inst->xf_grain_start + (uint32_t)inst->xf_position) % BUFFER_SIZE;
-            /* Pure fade-out ramp only — no Hann window. The Hann is near zero at
-             * the grain boundary where the crossfade starts, so applying it would
-             * make the crossfade grain silent (defeating the purpose). */
-            uint32_t xf_remaining = inst->xf_grain_size - (uint32_t)inst->xf_position;
-            float t = clampf((float)xf_remaining / (float)xf_len, 0.0f, 1.0f);
-            float xf_win = fast_sinf_0pi(t * 1.5707963f); /* equal-power cos fade-out */
+        /* ---- First pass: compute windows for all streams, then normalize ----
+         * For non-Hann shapes (trap, tri, rect morphs), w(p) + w(p+0.5) ≠ constant.
+         * Normalizing ensures the sum is always 1.0, eliminating rhythmic amplitude
+         * modulation at the grain rate regardless of envelope shape. */
+        float windows[NUM_GRAIN_STREAMS];
+        float win_sum = 0.0f;
 
-            float xf_frac = inst->xf_position - (uint32_t)inst->xf_position;
-            uint32_t xp0=(xf_src-1+BUFFER_SIZE)%BUFFER_SIZE, xp1=xf_src;
-            uint32_t xp2=(xf_src+1)%BUFFER_SIZE, xp3=(xf_src+2)%BUFFER_SIZE;
-            float xs_l = xf_win * hermite_interp(buf_l[xp0],buf_l[xp1],buf_l[xp2],buf_l[xp3],xf_frac);
-            float xs_r = xf_win * hermite_interp(buf_r[xp0],buf_r[xp1],buf_r[xp2],buf_r[xp3],xf_frac);
-            float xpan_l = 1.0f - clampf(inst->xf_pan, 0.0f, 1.0f);
-            float xpan_r = 1.0f + clampf(inst->xf_pan, -1.0f, 0.0f);
-            out_l[out_i] += xs_l * xpan_l;
-            out_r[out_i] += xs_r * xpan_r;
+        for (int si = 0; si < num_streams; si++) {
+            GrainStream *gs = &inst->stream[si];
+            uint32_t gs_gs = gs->locked_grain_size;
+            if (gs_gs < 4) { windows[si] = 0.0f; continue; }
 
-            inst->xf_position += inst->xf_speed;
-            if (inst->xf_position >= (float)inst->xf_grain_size)
-                inst->xf_active = 0;
-        }
+            float p = clampf(gs->playback_position / (float)gs_gs, 0.0f, 1.0f);
+            float w = 1.0f;
 
-        /* ---- Render main grain (slot A) ---- */
-        uint32_t evt_idx = inst->playback_index % inst->event_count;
-        StructorEvent *evt = &inst->events[evt_idx];
-
-        uint32_t grain_start = evt->sample_index;
-        if (grain_start > grain_size / 2)
-            grain_start -= grain_size / 2;
-
-        uint32_t src_pos = (grain_start + (uint32_t)inst->playback_position) % BUFFER_SIZE;
-
-        /* Window envelope */
-        float window_phase = inst->playback_position / (float)grain_size;
-        window_phase = clampf(window_phase, 0.0f, 1.0f);
-        float window = 1.0f;
-
-        if (inst->mode == MODE_DELTARUPT) {
-            float attack_dur = inst->deltarupt_attack;
-            if (attack_dur < 0.01f) {
-                window = 1.0f;
-            } else if (window_phase < attack_dur) {
-                float phase_in_attack = window_phase / attack_dur;
-                window = phase_in_attack * phase_in_attack;
+            if (is_deltarupt) {
+                float attack_dur = inst->deltarupt_attack;
+                if (attack_dur < 0.01f) w = 1.0f;
+                else if (p < attack_dur) { float t = p / attack_dur; w = t * t; }
+                else w = 1.0f;
             } else {
-                window = 1.0f;
-            }
-        } else {
-            float env = eff_envelope;
-            float hann_w = fast_sinf_0pi(window_phase * 3.14159265f);
-            float hann = hann_w * hann_w;
+                float env = eff_envelope;
+                float w_rect = 1.0f;
+                float w_tri = (p < 0.5f) ? (p * 2.0f) : (2.0f - p * 2.0f);
+                float w_trap;
+                if (p < 0.15f)       w_trap = p / 0.15f;
+                else if (p > 0.85f)  w_trap = (1.0f - p) / 0.15f;
+                else                 w_trap = 1.0f;
+                float hann_w = fast_sinf_0pi(p * 3.14159265f);
+                float w_hann = hann_w * hann_w;
+                float gx = p - 0.5f;
+                float w_gauss = expf(-23.0f * gx * gx);
 
-            if (env <= 0.5f) {
-                float t = env * 2.0f;
-                window = (1.0f - t) * 1.0f + t * hann;
-            } else {
-                float t = (env - 0.5f) * 2.0f;
-                float narrow_exp = 1.0f + t * 4.0f;
-                float narrow = fast_powf_01(hann, narrow_exp);
-                window = (1.0f - t) * hann + t * narrow;
+                if (env <= 0.25f)      w = lerpf(w_rect, w_tri, env * 4.0f);
+                else if (env <= 0.5f)  w = lerpf(w_tri, w_trap, (env - 0.25f) * 4.0f);
+                else if (env <= 0.75f) w = lerpf(w_trap, w_hann, (env - 0.5f) * 4.0f);
+                else                   w = lerpf(w_hann, w_gauss, (env - 0.75f) * 4.0f);
             }
+            windows[si] = w;
+            win_sum += w;
         }
 
-        /* Equal-power fade-in at grain start (complements crossfade fade-out) */
-        if (inst->mode != MODE_DELTARUPT) {
-            uint32_t pos = (uint32_t)inst->playback_position;
-            if (pos < xf_len) {
-                float t = (float)pos / (float)xf_len; /* 0→1 */
-                float fade_in = fast_sinf_0pi(t * 1.5707963f); /* sin fade-in */
-                window *= fade_in;
-            }
-        }
+        /* Normalize: total of all windows = 1.0 (COLA constraint) */
+        float win_norm = (win_sum > 0.001f) ? (1.0f / win_sum) : 1.0f;
 
-        /* Hermite interpolation */
-        uint32_t p0 = (src_pos - 1 + BUFFER_SIZE) % BUFFER_SIZE;
-        uint32_t p1 = src_pos;
-        uint32_t p2 = (src_pos + 1) % BUFFER_SIZE;
-        uint32_t p3 = (src_pos + 2) % BUFFER_SIZE;
+        /* ---- Second pass: render each stream with normalized window ---- */
+        for (int si = 0; si < num_streams; si++) {
+            GrainStream *gs = &inst->stream[si];
+            uint32_t grain_size = gs->locked_grain_size;
+            if (grain_size < 4) continue;
 
-        float frac = inst->playback_position - (uint32_t)inst->playback_position;
+            float window = windows[si] * win_norm;
 
-        float samp_l = window * hermite_interp(
-            buf_l[p0], buf_l[p1], buf_l[p2], buf_l[p3], frac);
-        float samp_r = window * hermite_interp(
-            buf_r[p0], buf_r[p1], buf_r[p2], buf_r[p3], frac);
+            uint32_t evt_idx = gs->playback_index % inst->event_count;
+            StructorEvent *evt = &inst->events[evt_idx];
 
-        /* Per-grain Isolator3 filter */
-        if (inst->rnd_filter > 0) {
-            float filt_param = inst->grain_filter_cutoff / 100.0f;
-            if (filt_param < 0.49f || filt_param > 0.51f) {
-                for (int s = 0; s < 3; s++) {
-                    samp_l = biquad_process(&inst->grain_filt_l[s], samp_l);
-                    samp_r = biquad_process(&inst->grain_filt_r[s], samp_r);
-                }
-            }
-        }
+            uint32_t grain_start = evt->sample_index;
+            if (grain_start > grain_size / 2)
+                grain_start -= grain_size / 2;
 
-        /* Per-grain pan */
-        float pan = inst->current_grain_pan;
-        float pan_l = 1.0f - clampf(pan, 0.0f, 1.0f);
-        float pan_r = 1.0f + clampf(pan, -1.0f, 0.0f);
-        out_l[out_i] += samp_l * pan_l;
-        out_r[out_i] += samp_r * pan_r;
+            uint32_t src_pos = (grain_start + (uint32_t)gs->playback_position) % BUFFER_SIZE;
 
-        /* Reverb send: accumulate grain audio into reverb bus if flagged */
-        if (inst->grain_reverb_send && inst->rnd_reverb > 0.0f)
-            inst->rev_bus[out_i] += (samp_l + samp_r) * 0.5f;
+            /* Hermite interpolation */
+            uint32_t p0 = (src_pos - 1 + BUFFER_SIZE) % BUFFER_SIZE;
+            uint32_t p1 = src_pos;
+            uint32_t p2 = (src_pos + 1) % BUFFER_SIZE;
+            uint32_t p3 = (src_pos + 2) % BUFFER_SIZE;
+            float frac = gs->playback_position - (uint32_t)gs->playback_position;
 
-        /* Playback speed */
-        float speed = eff_time_warp;
-        if (inst->mode == MODE_TIME_WARP) {
-            float norm_amp = clampf(evt->density, 0.001f, 1.0f);
-            float speed_factor = fast_powf_01(norm_amp, inst->speed_curve_exp);
-            speed = lerpf(0.25f, 2.0f, speed_factor) * eff_time_warp;
-        } else if (inst->mode == MODE_DENSITY_ARP) {
-            speed = lerpf(0.8f, 1.2f, evt->density) * eff_time_warp;
-        }
+            float samp_l = window * hermite_interp(
+                buf_l[p0], buf_l[p1], buf_l[p2], buf_l[p3], frac);
+            float samp_r = window * hermite_interp(
+                buf_r[p0], buf_r[p1], buf_r[p2], buf_r[p3], frac);
 
-        inst->playback_position += speed;
-
-        /* ---- Grain transition: move current to crossfade slot, start next ---- */
-        if (inst->playback_position >= (float)grain_size) {
-            /* Save current grain state into crossfade slot B */
-            inst->xf_active = 1;
-            inst->xf_position = inst->playback_position; /* continue from where we are */
-            inst->xf_grain_start = grain_start;
-            inst->xf_grain_size = grain_size + xf_len; /* extend tail for fade-out */
-            inst->xf_speed = speed;
-            inst->xf_pan = inst->current_grain_pan;
-
-            /* Start new grain in slot A */
-            inst->playback_position = 0.0f;
-            inst->playback_index++;
-            /* New random pan */
-            float eff_pan = clampf(inst->rnd_pan + inst->seq_pan_offset, 0.0f, 1.0f);
-            inst->current_grain_pan = rand_bipolar(&inst->rng) * eff_pan;
-            /* Reverb send: stochastic per-grain decision */
-            inst->grain_reverb_send = (inst->rnd_reverb > 0.0f && rand_unipolar(&inst->rng) < inst->rnd_reverb) ? 1 : 0;
-            /* New random filter cutoff */
+            /* Per-grain Isolator3 filter */
             if (inst->rnd_filter > 0) {
-                float eff_chance = clampf((float)inst->rnd_filter / 100.0f + inst->seq_filter_offset, 0.0f, 1.0f);
-                if (rand_unipolar(&inst->rng) < eff_chance) {
-                    float base_cutoff = rand_unipolar(&inst->rng) * 100.0f;
-                    inst->grain_filter_cutoff = clampf(base_cutoff + inst->seq_filter_offset * 50.0f, 0.0f, 100.0f);
-                }
-                float fc = inst->grain_filter_cutoff;
-                float filt_param = fc / 100.0f;
-                if (filt_param < 0.49f) {
-                    float t = (0.49f - filt_param) / 0.49f;
-                    float lp_f = 18000.0f * powf(200.0f / 18000.0f, t);
-                    for (int s = 0; s < 3; s++) {
-                        biquad_lpf(&inst->grain_filt_l[s], lp_f, 0.707f);
-                        biquad_lpf(&inst->grain_filt_r[s], lp_f, 0.707f);
+                float filt_param = gs->grain_filter_cutoff / 100.0f;
+                if (filt_param < 0.49f || filt_param > 0.51f) {
+                    for (int f = 0; f < 3; f++) {
+                        samp_l = biquad_process(&gs->grain_filt_l[f], samp_l);
+                        samp_r = biquad_process(&gs->grain_filt_r[f], samp_r);
                     }
-                } else if (filt_param > 0.51f) {
-                    float t = (filt_param - 0.51f) / 0.49f;
-                    float hp_f = 20.0f * powf(400.0f, t);
-                    for (int s = 0; s < 3; s++) {
-                        biquad_hpf(&inst->grain_filt_l[s], hp_f, 0.707f);
-                        biquad_hpf(&inst->grain_filt_r[s], hp_f, 0.707f);
-                    }
-                }
-                for (int s = 0; s < 3; s++) {
-                    biquad_reset(&inst->grain_filt_l[s]);
-                    biquad_reset(&inst->grain_filt_r[s]);
                 }
             }
-            inst->locked_grain_size = new_grain_size;
-            grain_size = new_grain_size;
-            if (inst->playback_index >= inst->event_count)
-                inst->playback_index = 0;
+
+            /* Per-grain pan */
+            float pan = gs->current_grain_pan;
+            float pan_l = 1.0f - clampf(pan, 0.0f, 1.0f);
+            float pan_r = 1.0f + clampf(pan, -1.0f, 0.0f);
+            out_l[out_i] += samp_l * pan_l;
+            out_r[out_i] += samp_r * pan_r;
+
+            /* Reverb send */
+            if (gs->grain_reverb_send && inst->rnd_reverb > 0.0f)
+                inst->rev_bus[out_i] += (samp_l + samp_r) * 0.5f;
+
+            /* Playback speed */
+            float speed = eff_time_warp;
+            if (inst->mode == MODE_TIME_WARP) {
+                float norm_amp = clampf(evt->density, 0.001f, 1.0f);
+                float speed_factor = fast_powf_01(norm_amp, inst->speed_curve_exp);
+                speed = lerpf(0.25f, 2.0f, speed_factor) * eff_time_warp;
+            } else if (inst->mode == MODE_DENSITY_ARP) {
+                speed = lerpf(0.8f, 1.2f, evt->density) * eff_time_warp;
+            }
+
+            gs->playback_position += speed;
+
+            /* ---- Grain transition: start next event ---- */
+            if (gs->playback_position >= (float)grain_size) {
+                gs->playback_position = 0.0f;
+                /* Grab next event from the shared counter */
+                gs->playback_index = inst->next_grain_index % inst->event_count;
+                inst->next_grain_index++;
+
+                /* New random pan */
+                float eff_pan = clampf(inst->rnd_pan + inst->seq_pan_offset, 0.0f, 1.0f);
+                gs->current_grain_pan = rand_bipolar(&inst->rng) * eff_pan;
+                /* Reverb send: stochastic per-grain decision */
+                gs->grain_reverb_send = (inst->rnd_reverb > 0.0f && rand_unipolar(&inst->rng) < inst->rnd_reverb) ? 1 : 0;
+                /* New random filter cutoff */
+                if (inst->rnd_filter > 0) {
+                    float eff_chance = clampf((float)inst->rnd_filter / 100.0f + inst->seq_filter_offset, 0.0f, 1.0f);
+                    if (rand_unipolar(&inst->rng) < eff_chance) {
+                        float base_cutoff = rand_unipolar(&inst->rng) * 100.0f;
+                        gs->grain_filter_cutoff = clampf(base_cutoff + inst->seq_filter_offset * 50.0f, 0.0f, 100.0f);
+                    }
+                    float fc = gs->grain_filter_cutoff;
+                    float filt_param = fc / 100.0f;
+                    if (filt_param < 0.49f) {
+                        float t = (0.49f - filt_param) / 0.49f;
+                        float lp_f = 18000.0f * powf(200.0f / 18000.0f, t);
+                        for (int f = 0; f < 3; f++) {
+                            biquad_lpf(&gs->grain_filt_l[f], lp_f, 0.707f);
+                            biquad_lpf(&gs->grain_filt_r[f], lp_f, 0.707f);
+                        }
+                    } else if (filt_param > 0.51f) {
+                        float t = (filt_param - 0.51f) / 0.49f;
+                        float hp_f = 20.0f * powf(400.0f, t);
+                        for (int f = 0; f < 3; f++) {
+                            biquad_hpf(&gs->grain_filt_l[f], hp_f, 0.707f);
+                            biquad_hpf(&gs->grain_filt_r[f], hp_f, 0.707f);
+                        }
+                    }
+                    for (int f = 0; f < 3; f++) {
+                        biquad_reset(&gs->grain_filt_l[f]);
+                        biquad_reset(&gs->grain_filt_r[f]);
+                    }
+                }
+                gs->locked_grain_size = new_grain_size;
+            }
         }
     }
 }
@@ -1307,13 +1320,21 @@ static void* structor_create(const char *module_dir, const char *config_json) {
     inst->rnd_grain = 0.0f;
     inst->rnd_time = 0.0f;
     inst->rnd_pan = 0.25f;
-    inst->current_grain_pan = 0.0f;
     inst->rnd_filter = 0;
-    inst->grain_filter_cutoff = 50.0f;  /* bypass */
-    for (int i = 0; i < 3; i++) {
-        biquad_reset(&inst->grain_filt_l[i]);
-        biquad_reset(&inst->grain_filt_r[i]);
+    /* Initialize grain streams */
+    for (int s = 0; s < NUM_GRAIN_STREAMS; s++) {
+        inst->stream[s].playback_position = 0.0f;
+        inst->stream[s].playback_index = s;  /* stream 1 starts at event 1 */
+        inst->stream[s].locked_grain_size = 0;
+        inst->stream[s].current_grain_pan = 0.0f;
+        inst->stream[s].grain_reverb_send = 0;
+        inst->stream[s].grain_filter_cutoff = 50.0f;  /* bypass */
+        for (int i = 0; i < 3; i++) {
+            biquad_reset(&inst->stream[s].grain_filt_l[i]);
+            biquad_reset(&inst->stream[s].grain_filt_r[i]);
+        }
     }
+    inst->next_grain_index = NUM_GRAIN_STREAMS;
     inst->seq_on = 0;
     inst->seq_time_ms = 200.0f;
     inst->seq_mult = 4;  /* 1x */
@@ -1340,7 +1361,6 @@ static void* structor_create(const char *module_dir, const char *config_json) {
     inst->rev_size = 0.5f;
     inst->rev_decay = 0.5f;
     inst->rev_damp = 0.5f;
-    inst->grain_reverb_send = 0;
     reverb_init(inst);
     reverb_update_params(inst);
 
@@ -1365,7 +1385,7 @@ static void* structor_create(const char *module_dir, const char *config_json) {
      * with the preset table values for envelope/density/grain/tw/mix/fb/mode/filter/reverb */
     apply_structor_preset(inst, 0);
 
-    if (g_host && g_host->log) g_host->log("[structor] instance created");
+    if (g_host && g_host->log) g_host->log("[structor] v3 dual-stream OLA instance created");
     return inst;
 }
 
@@ -1431,9 +1451,17 @@ static void structor_process(void *instance, int16_t *audio_inout, int frames) {
         detect_events(inst, window_start, detect_win);
         build_playback_order(inst);
 
-        /* Reset playback to start of new order */
-        inst->playback_index = 0;
-        inst->playback_position = 0.0f;
+        /* Reset both grain streams to start of new order.
+         * Stream 0 starts at event 0, position 0 (beginning of grain).
+         * Stream 1 starts at event 1 with locked_grain_size=0 to trigger
+         * phase offset initialization in reconstruct(). */
+        inst->stream[0].playback_index = 0;
+        inst->stream[0].playback_position = 0.0f;
+        inst->stream[0].locked_grain_size = 0;
+        inst->stream[1].playback_index = 1 % inst->event_count;
+        inst->stream[1].playback_position = 0.0f;
+        inst->stream[1].locked_grain_size = 0;
+        inst->next_grain_index = 2 % inst->event_count;
         inst->blocks_since_detect = 0;
     }
 
@@ -1505,6 +1533,11 @@ static void structor_process(void *instance, int16_t *audio_inout, int frames) {
         }
     }
 
+    /* With COLA normalization, the dual-stream OLA sum is always exactly 1.0
+     * regardless of envelope shape — no per-shape gain compensation needed.
+     * RECON_GAIN_BASE provides the base makeup gain for the reconstruction. */
+    float recon_gain = RECON_GAIN_BASE;
+
     /* Mix wet/dry with equal-power crossfade (no volume dip at 50%) */
     float mix_angle = inst->mix * 1.5707963f;  /* 0..pi/2 */
     float dry = cosf(mix_angle);  /* once per block — keep precise */
@@ -1542,8 +1575,8 @@ static void structor_process(void *instance, int16_t *audio_inout, int frames) {
         float in_l = audio_inout[i * 2]     / 32768.0f;
         float in_r = audio_inout[i * 2 + 1] / 32768.0f;
 
-        float out_l = dry * in_l + wet * inst->recon_l[i] * RECON_GAIN;
-        float out_r = dry * in_r + wet * inst->recon_r[i] * RECON_GAIN;
+        float out_l = dry * in_l + wet * inst->recon_l[i] * recon_gain;
+        float out_r = dry * in_r + wet * inst->recon_r[i] * recon_gain;
 
         /* Master DJ filter (Isolator3 3-stage cascade, smoothed) */
         if (mf_active) {
@@ -1736,7 +1769,10 @@ static void structor_set_param(void *instance, const char *key, const char *val)
         } else {
             inst->rnd_filter = clampi(atoi(val), 0, 100);
         }
-        if (inst->rnd_filter == 0) inst->grain_filter_cutoff = 50.0f;  /* reset to bypass */
+        if (inst->rnd_filter == 0) {
+            for (int si = 0; si < NUM_GRAIN_STREAMS; si++)
+                inst->stream[si].grain_filter_cutoff = 50.0f;  /* reset to bypass */
+        }
     } else if (strcmp(key, "seq_on") == 0) {
         if (strcmp(val, "On") == 0) inst->seq_on = 1;
         else if (strcmp(val, "Off") == 0) inst->seq_on = 0;
