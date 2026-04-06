@@ -141,6 +141,8 @@ typedef struct {
     float playback_position;
     uint32_t playback_index;
     uint32_t locked_grain_size;
+    uint32_t cached_grain_start;  /* buffer position locked at grain start — immune to re-detection */
+    float cached_density;         /* event density cached at grain start — for speed calculation */
     float current_grain_pan;
     int grain_reverb_send;
     float grain_filter_cutoff;
@@ -1101,11 +1103,21 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
     if (new_grain_size < 4) new_grain_size = 4;
     if (new_grain_size > 65536) new_grain_size = 65536;
 
-    /* Lock grain_size at grain start for each stream */
+    /* Lock grain_size at grain start for each stream, and cache event data */
     for (int si = 0; si < NUM_GRAIN_STREAMS; si++) {
         GrainStream *gs = &inst->stream[si];
-        if (gs->locked_grain_size == 0 || gs->playback_position < 1.0f)
+        if (gs->locked_grain_size == 0 || gs->playback_position < 1.0f) {
             gs->locked_grain_size = new_grain_size;
+            /* Cache event data for this grain */
+            if (inst->event_count > 0) {
+                StructorEvent *evt = &inst->events[gs->playback_index % inst->event_count];
+                uint32_t gs_start = evt->sample_index;
+                if (gs_start > new_grain_size / 2)
+                    gs_start -= new_grain_size / 2;
+                gs->cached_grain_start = gs_start;
+                gs->cached_density = evt->density;
+            }
+        }
     }
 
     /* Initialize stream 1 phase offset: start at 50% of grain for OLA overlap.
@@ -1175,14 +1187,8 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
 
             float window = windows[si] * win_norm;
 
-            uint32_t evt_idx = gs->playback_index % inst->event_count;
-            StructorEvent *evt = &inst->events[evt_idx];
-
-            uint32_t grain_start = evt->sample_index;
-            if (grain_start > grain_size / 2)
-                grain_start -= grain_size / 2;
-
-            uint32_t src_pos = (grain_start + (uint32_t)gs->playback_position) % BUFFER_SIZE;
+            /* Use cached grain start — immune to event re-detection mid-grain */
+            uint32_t src_pos = (gs->cached_grain_start + (uint32_t)gs->playback_position) % BUFFER_SIZE;
 
             /* Hermite interpolation */
             uint32_t p0 = (src_pos - 1 + BUFFER_SIZE) % BUFFER_SIZE;
@@ -1218,14 +1224,14 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
             if (gs->grain_reverb_send && inst->rnd_reverb > 0.0f)
                 inst->rev_bus[out_i] += (samp_l + samp_r) * 0.5f;
 
-            /* Playback speed */
+            /* Playback speed (uses cached density from grain start) */
             float speed = eff_time_warp;
             if (inst->mode == MODE_TIME_WARP) {
-                float norm_amp = clampf(evt->density, 0.001f, 1.0f);
+                float norm_amp = clampf(gs->cached_density, 0.001f, 1.0f);
                 float speed_factor = fast_powf_01(norm_amp, inst->speed_curve_exp);
                 speed = lerpf(0.25f, 2.0f, speed_factor) * eff_time_warp;
             } else if (inst->mode == MODE_DENSITY_ARP) {
-                speed = lerpf(0.8f, 1.2f, evt->density) * eff_time_warp;
+                speed = lerpf(0.8f, 1.2f, gs->cached_density) * eff_time_warp;
             }
 
             gs->playback_position += speed;
@@ -1236,6 +1242,16 @@ static void reconstruct(StructorInstance *inst, uint32_t num_samples) {
                 /* Grab next event from the shared counter */
                 gs->playback_index = inst->next_grain_index % inst->event_count;
                 inst->next_grain_index++;
+
+                /* Cache event data for this grain — immune to re-detection */
+                {
+                    StructorEvent *new_evt = &inst->events[gs->playback_index % inst->event_count];
+                    uint32_t gs_start = new_evt->sample_index;
+                    if (gs_start > new_grain_size / 2)
+                        gs_start -= new_grain_size / 2;
+                    gs->cached_grain_start = gs_start;
+                    gs->cached_density = new_evt->density;
+                }
 
                 /* New random pan */
                 float eff_pan = clampf(inst->rnd_pan + inst->seq_pan_offset, 0.0f, 1.0f);
@@ -1326,6 +1342,8 @@ static void* structor_create(const char *module_dir, const char *config_json) {
         inst->stream[s].playback_position = 0.0f;
         inst->stream[s].playback_index = s;  /* stream 1 starts at event 1 */
         inst->stream[s].locked_grain_size = 0;
+        inst->stream[s].cached_grain_start = 0;
+        inst->stream[s].cached_density = 0.5f;
         inst->stream[s].current_grain_pan = 0.0f;
         inst->stream[s].grain_reverb_send = 0;
         inst->stream[s].grain_filter_cutoff = 50.0f;  /* bypass */
@@ -1451,17 +1469,11 @@ static void structor_process(void *instance, int16_t *audio_inout, int frames) {
         detect_events(inst, window_start, detect_win);
         build_playback_order(inst);
 
-        /* Reset both grain streams to start of new order.
-         * Stream 0 starts at event 0, position 0 (beginning of grain).
-         * Stream 1 starts at event 1 with locked_grain_size=0 to trigger
-         * phase offset initialization in reconstruct(). */
-        inst->stream[0].playback_index = 0;
-        inst->stream[0].playback_position = 0.0f;
-        inst->stream[0].locked_grain_size = 0;
-        inst->stream[1].playback_index = 1 % inst->event_count;
-        inst->stream[1].playback_position = 0.0f;
-        inst->stream[1].locked_grain_size = 0;
-        inst->next_grain_index = 2 % inst->event_count;
+        /* DON'T reset stream positions — that causes a click every ~371ms.
+         * Current grains continue playing (cached_grain_start is immune to
+         * event re-detection). Just reset the shared event counter so new
+         * events are used at the next natural grain transition. */
+        inst->next_grain_index = 0;
         inst->blocks_since_detect = 0;
     }
 
